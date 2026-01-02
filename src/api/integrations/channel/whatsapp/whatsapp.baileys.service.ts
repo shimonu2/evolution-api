@@ -67,7 +67,6 @@ import {
   Chatwoot,
   ConfigService,
   configService,
-  ConfigSessionPhone,
   Database,
   Log,
   Openai,
@@ -143,7 +142,6 @@ import Long from 'long';
 import mimeTypes from 'mime-types';
 import NodeCache from 'node-cache';
 import cron from 'node-cron';
-import { release } from 'os';
 import { join } from 'path';
 import P from 'pino';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
@@ -576,19 +574,68 @@ export class BaileysStartupService extends ChannelStartupService {
   private async createClient(number?: string): Promise<WASocket> {
     this.instance.authState = await this.defineAuthState();
 
-    const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
-
-    let browserOptions = {};
+    // Enhanced browser simulation
+    const userAgent =
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    // WABrowserDescription expects exactly 3 elements: [browser, version, platform]
+    const browserDescription: WABrowserDescription = [
+      'Chrome', // browser
+      '120.0.0.0', // version
+      'Windows', // platform
+    ];
+    const browserOptions = {
+      browser: browserDescription,
+      userAgent,
+      appVersion:
+        '5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      platform: 'win32',
+      headers: {
+        'User-Agent': userAgent,
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-User': '?1',
+        'Sec-Fetch-Dest': 'document',
+        'Cache-Control': 'max-age=0',
+        Connection: 'keep-alive',
+        Pragma: 'no-cache',
+        Referer: 'https://web.whatsapp.com/',
+        Origin: 'https://web.whatsapp.com',
+      },
+      // Add more browser-like behavior
+      followRedirects: true,
+      maxRedirects: 20,
+      timeout: 30000,
+      maxRetries: 3,
+      retryDelay: 1000,
+      // Add WebSocket settings
+      ws: {
+        origin: 'https://web.whatsapp.com',
+        headers: {
+          'User-Agent': userAgent,
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache',
+          'Sec-WebSocket-Extensions': 'permessage-deflate; client_max_window_bits',
+          'Sec-WebSocket-Key': 'random-key-here',
+          'Sec-WebSocket-Version': '13',
+          Upgrade: 'websocket',
+        },
+        maxPayload: 100 * 1024 * 1024, // 100MB
+        followRedirects: true,
+        maxRedirects: 10,
+      },
+    };
 
     if (number || this.phoneNumber) {
       this.phoneNumber = number;
-
       this.logger.info(`Phone number: ${number}`);
     } else {
-      const browser: WABrowserDescription = [session.CLIENT, session.NAME, release()];
-      browserOptions = { browser };
-
-      this.logger.info(`Browser: ${browser}`);
+      this.logger.info(`Using enhanced browser simulation`);
     }
 
     const baileysVersion = await fetchLatestWaWebVersion({});
@@ -640,6 +687,24 @@ export class BaileysStartupService extends ChannelStartupService {
       version,
       logger: P({ level: this.logBaileys }),
       printQRInTerminal: false,
+      // Add browser-like headers to all requests
+      fetchAgent: makeProxyAgentUndici({
+        ...(options?.fetchAgent?.options || {}),
+        headers: {
+          ...(options?.fetchAgent?.options?.headers || {}),
+          'User-Agent': browserOptions.userAgent,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          Origin: 'https://web.whatsapp.com',
+          Referer: 'https://web.whatsapp.com/',
+          'Sec-Fetch-Site': 'same-origin',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Dest': 'empty',
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache',
+        },
+      }),
       auth: {
         creds: this.instance.authState.state.creds,
         keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, P({ level: 'error' }) as any),
