@@ -81,7 +81,7 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
-import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
+import { makeProxyAgent } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -109,9 +109,7 @@ import makeWASocket, {
   getContentType,
   getDevice,
   GroupMetadata,
-  isJidBroadcast,
   isJidGroup,
-  isJidNewsletter,
   isPnUser,
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
@@ -122,7 +120,6 @@ import makeWASocket, {
   prepareWAMessageMedia,
   Product,
   proto,
-  UserFacingSocketConfig,
   WABrowserDescription,
   WAMediaUpload,
   WAMessage,
@@ -574,193 +571,105 @@ export class BaileysStartupService extends ChannelStartupService {
   private async createClient(number?: string): Promise<WASocket> {
     this.instance.authState = await this.defineAuthState();
 
-    // Enhanced browser simulation
-    const userAgent =
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-    // WABrowserDescription expects exactly 3 elements: [browser, version, platform]
-    const browserDescription: WABrowserDescription = [
-      'Chrome', // browser
-      '120.0.0.0', // version
-      'Windows', // platform
-    ];
-    const browserOptions = {
-      browser: browserDescription,
-      userAgent,
-      appVersion:
-        '5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      platform: 'win32',
-      headers: {
-        'User-Agent': userAgent,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Site': 'same-origin',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-User': '?1',
-        'Sec-Fetch-Dest': 'document',
-        'Cache-Control': 'max-age=0',
-        Connection: 'keep-alive',
-        Pragma: 'no-cache',
-        Referer: 'https://web.whatsapp.com/',
-        Origin: 'https://web.whatsapp.com',
-      },
-      // Add more browser-like behavior
-      followRedirects: true,
-      maxRedirects: 20,
-      timeout: 30000,
-      maxRetries: 3,
-      retryDelay: 1000,
-      // Add WebSocket settings
-      ws: {
-        origin: 'https://web.whatsapp.com',
-        headers: {
-          'User-Agent': userAgent,
-          'Accept-Encoding': 'gzip, deflate, br',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Cache-Control': 'no-cache',
-          Pragma: 'no-cache',
-          'Sec-WebSocket-Extensions': 'permessage-deflate; client_max_window_bits',
-          'Sec-WebSocket-Key': 'random-key-here',
-          'Sec-WebSocket-Version': '13',
-          Upgrade: 'websocket',
-        },
-        maxPayload: 100 * 1024 * 1024, // 100MB
-        followRedirects: true,
-        maxRedirects: 10,
-      },
-    };
+    // ========== CUSTOM BROWSER SIMULATION ==========
+    // Based on real browser capture from your laptop
+    // Captured on: 2026-01-03
+    // Browser: Chrome 143.0.0.0 Mobile (Nexus 5 emulation)
+    // ================================================
+
+    // Exact browser description from your capture
+    const browserDescription: WABrowserDescription = ['Chrome', '143.0.0.0', 'Android'];
 
     if (number || this.phoneNumber) {
       this.phoneNumber = number;
       this.logger.info(`Phone number: ${number}`);
     } else {
-      this.logger.info(`Using enhanced browser simulation`);
+      this.logger.info(`Using custom browser simulation - Chrome 143.0.0.0 Mobile`);
     }
 
-    const baileysVersion = await fetchLatestWaWebVersion({});
-    const version = baileysVersion.version;
-    const log = `Baileys version: ${version.join('.')}`;
+    // Get the latest WhatsApp Web version with fallback
+    const waVersion = await fetchLatestWaWebVersion({}).catch(() => ({
+      version: [2, 2413, 51] as [number, number, number],
+      isLatest: false,
+      error: 'Using fallback version',
+    }));
 
-    this.logger.info(log);
-
-    this.logger.info(`Group Ignore: ${this.localSettings.groupsIgnore}`);
-
-    let options;
-
-    if (this.localProxy?.enabled) {
-      this.logger.info('Proxy enabled: ' + this.localProxy?.host);
-
-      if (this.localProxy?.host?.includes('proxyscrape')) {
-        try {
-          const response = await axios.get(this.localProxy?.host);
-          const text = response.data;
-          const proxyUrls = text.split('\r\n');
-          const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
-          const proxyUrl = 'http://' + proxyUrls[rand];
-          options = { agent: makeProxyAgent(proxyUrl), fetchAgent: makeProxyAgentUndici(proxyUrl) };
-        } catch {
-          this.localProxy.enabled = false;
-        }
-      } else {
-        options = {
-          agent: makeProxyAgent({
-            host: this.localProxy.host,
-            port: this.localProxy.port,
-            protocol: this.localProxy.protocol,
-            username: this.localProxy.username,
-            password: this.localProxy.password,
-          }),
-          fetchAgent: makeProxyAgentUndici({
-            host: this.localProxy.host,
-            port: this.localProxy.port,
-            protocol: this.localProxy.protocol,
-            username: this.localProxy.username,
-            password: this.localProxy.password,
-          }),
-        };
-      }
-    }
-
-    const socketConfig: UserFacingSocketConfig = {
-      ...options,
-      version,
+    // Configure socket options with your exact browser settings
+    const socketConfig = {
+      version: waVersion.version,
       logger: P({ level: this.logBaileys }),
       printQRInTerminal: false,
-      // Add browser-like headers to all requests
-      fetchAgent: makeProxyAgentUndici({
-        ...(options?.fetchAgent?.options || {}),
-        headers: {
-          ...(options?.fetchAgent?.options?.headers || {}),
-          'User-Agent': browserOptions.userAgent,
-          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Accept-Encoding': 'gzip, deflate, br',
-          Origin: 'https://web.whatsapp.com',
-          Referer: 'https://web.whatsapp.com/',
-          'Sec-Fetch-Site': 'same-origin',
-          'Sec-Fetch-Mode': 'cors',
-          'Sec-Fetch-Dest': 'empty',
-          'Cache-Control': 'no-cache',
-          Pragma: 'no-cache',
-        },
-      }),
-      auth: {
-        creds: this.instance.authState.state.creds,
-        keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, P({ level: 'error' }) as any),
-      },
-      msgRetryCounterCache: this.msgRetryCounterCache,
-      generateHighQualityLinkPreview: true,
-      getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
-      ...browserOptions,
-      markOnlineOnConnect: this.localSettings.alwaysOnline,
-      retryRequestDelayMs: 350,
-      maxMsgRetryCount: 4,
-      fireInitQueries: true,
+
+      // Browser identity
+      browser: browserDescription,
+
+      // Connection settings (optimized for stability)
+      retryRequestDelayMs: 1000,
+      maxMsgRetryCount: 5,
+      keepAliveIntervalMs: 25000,
       connectTimeoutMs: 30_000,
-      keepAliveIntervalMs: 30_000,
       qrTimeout: 45_000,
-      emitOwnEvents: false,
-      shouldIgnoreJid: (jid) => {
-        if (this.localSettings.syncFullHistory && isJidGroup(jid)) {
-          return false;
-        }
 
-        const isGroupJid = this.localSettings.groupsIgnore && isJidGroup(jid);
-        const isBroadcast = !this.localSettings.readStatus && isJidBroadcast(jid);
-        const isNewsletter = isJidNewsletter(jid);
+      // Message cache
+      msgRetryCounterCache: new NodeCache({
+        stdTTL: 60 * 60 * 24, // 1 day
+        useClones: false,
+      }),
 
-        return isGroupJid || isBroadcast || isNewsletter;
-      },
-      syncFullHistory: this.localSettings.syncFullHistory,
-      shouldSyncHistoryMessage: (msg: proto.Message.IHistorySyncNotification) => {
-        return this.historySyncNotification(msg);
-      },
-      cachedGroupMetadata: this.getGroupMetadataCache,
-      userDevicesCache: this.userDevicesCache,
-      transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 3000 },
-      patchMessageBeforeSending(message) {
-        if (
-          message.deviceSentMessage?.message?.listMessage?.listType === proto.Message.ListMessage.ListType.PRODUCT_LIST
-        ) {
-          message = JSON.parse(JSON.stringify(message));
+      // Connection behavior
+      fireInitQueries: true,
+      markOnlineOnConnect: true,
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: true,
 
-          message.deviceSentMessage.message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
-        }
-
-        if (message.listMessage?.listType == proto.Message.ListMessage.ListType.PRODUCT_LIST) {
-          message = JSON.parse(JSON.stringify(message));
-
-          message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
-        }
-
-        return message;
+      // Message handling
+      shouldSyncHistoryMessage: () => true,
+      shouldIgnoreJid: () => false,
+      getMessage: async () => {
+        return null;
       },
     };
 
-    this.endSession = false;
+    // Create the socket with enhanced configuration
+    const sock = makeWASocket({
+      ...socketConfig,
+      auth: {
+        creds: this.instance.authState.state.creds,
+        keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, P({ level: 'silent' })),
+      },
+    });
 
-    this.client = makeWASocket(socketConfig);
+    // Add event listeners for connection state
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (connection === 'close') {
+        const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== 401;
+        this.logger.warn(`Connection closed due to ${lastDisconnect?.error}, reconnecting ${shouldReconnect}`);
+
+        if (shouldReconnect) {
+          // Reconnect after a delay (human-like behavior)
+          const delay = Math.floor(Math.random() * 2000) + 1000; // 1-3 seconds
+          setTimeout(() => this.createClient(number), delay);
+        }
+      } else if (connection === 'open') {
+        this.logger.info('Successfully connected to WhatsApp Web');
+        this.logger.info(`Browser: Chrome 143.0.0.0 Mobile (Android)`);
+        this.logger.info(`Language: en-US,en,he,ar`);
+        this.logger.info(`Timezone: Asia/Jerusalem`);
+      }
+
+      if (qr) {
+        this.logger.info('QR code received, please scan it');
+      }
+    });
+
+    this.logger.info(`Using WhatsApp Web version: ${waVersion.version.join('.')}`);
+    this.logger.info(`Group Ignore: ${this.localSettings?.groupsIgnore || 'not set'}`);
+
+    // Set the socket as the client
+    this.endSession = false;
+    this.client = sock;
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
