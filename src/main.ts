@@ -20,6 +20,7 @@ import { onUnexpectedError } from '@config/error.config';
 import { Logger } from '@config/logger.config';
 import { ROOT_DIR } from '@config/path.config';
 import * as Sentry from '@sentry/node';
+import { instanceStateGauge, metricsEnabled, registry as metricsRegistry } from '@utils/metrics';
 import { ServerUP } from '@utils/server-up';
 import axios from 'axios';
 import compression from 'compression';
@@ -67,6 +68,31 @@ async function bootstrap() {
     }
   });
 
+  // Prometheus scrape endpoint. Unauthenticated and skipped by rate limiter
+  // — put it behind a network policy / firewall instead of ACL here so the
+  // scraper can poll cheaply.
+  if (metricsEnabled) {
+    app.get('/metrics', async (_req, res) => {
+      try {
+        // Refresh instance-state gauge on each scrape so the numbers always
+        // reflect the current in-memory waInstances map.
+        const byState: Record<string, number> = {};
+        for (const inst of Object.values(waMonitor.waInstances ?? {})) {
+          const state = (inst as any)?.stateConnection?.state ?? 'unknown';
+          byState[state] = (byState[state] ?? 0) + 1;
+        }
+        instanceStateGauge.reset();
+        for (const [state, count] of Object.entries(byState)) {
+          instanceStateGauge.labels(state).set(count);
+        }
+        res.set('Content-Type', metricsRegistry.contentType);
+        res.end(await metricsRegistry.metrics());
+      } catch (e) {
+        res.status(500).end(String((e as Error)?.message ?? e));
+      }
+    });
+  }
+
   app.use(
     helmet({
       // Contact is a JSON API; CSP has no meaningful target. Keep it off to
@@ -89,8 +115,8 @@ async function bootstrap() {
         max: rateLimitMax,
         standardHeaders: 'draft-7',
         legacyHeaders: false,
-        // Never rate-limit health probes
-        skip: (req) => req.path.startsWith('/health'),
+        // Never rate-limit health probes or Prometheus scrapes
+        skip: (req) => req.path.startsWith('/health') || req.path === '/metrics',
       }),
     );
   }
