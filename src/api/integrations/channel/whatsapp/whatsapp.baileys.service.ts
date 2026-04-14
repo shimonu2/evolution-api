@@ -574,17 +574,17 @@ export class BaileysStartupService extends ChannelStartupService {
     // ========== CUSTOM BROWSER SIMULATION ==========
     // Based on real browser capture from your laptop
     // Captured on: 2026-01-03
-    // Browser: Chrome 143.0.0.0 Mobile (Nexus 5 emulation)
+    // Browser: Chrome 147.0.7727.55 Mobile (Nexus 5 emulation)
     // ================================================
 
     // Exact browser description from your capture
-    const browserDescription: WABrowserDescription = ['Chrome', '143.0.0.0', 'Android'];
+    const browserDescription: WABrowserDescription = ['Chrome', '147.0.7727.55', 'Android'];
 
     if (number || this.phoneNumber) {
       this.phoneNumber = number;
       this.logger.info(`Phone number: ${number}`);
     } else {
-      this.logger.info(`Using custom browser simulation - Chrome 143.0.0.0 Mobile`);
+      this.logger.info(`Using custom browser simulation - Chrome 147.0.7727.55 Mobile`);
     }
 
     // Get the latest WhatsApp Web version with fallback
@@ -654,7 +654,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       } else if (connection === 'open') {
         this.logger.info('Successfully connected to WhatsApp Web');
-        this.logger.info(`Browser: Chrome 143.0.0.0 Mobile (Android)`);
+        this.logger.info(`Browser: Chrome 147.0.7727.55 Mobile (Android)`);
         this.logger.info(`Language: en-US,en,he,ar`);
         this.logger.info(`Timezone: Asia/Jerusalem`);
       }
