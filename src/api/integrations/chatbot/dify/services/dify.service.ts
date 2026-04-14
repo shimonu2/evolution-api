@@ -3,6 +3,7 @@ import { WAMonitoringService } from '@api/services/monitor.service';
 import { Integration } from '@api/types/wa.types';
 import { ConfigService, HttpServer } from '@config/env.config';
 import { Dify, DifySetting, IntegrationSession } from '@prisma/client';
+import { circuitPost } from '@utils/circuitBreaker';
 import axios from 'axios';
 import { isURL } from 'class-validator';
 
@@ -120,7 +121,7 @@ export class DifyService extends BaseChatbotService<Dify, DifySetting> {
           await instance.client.sendPresenceUpdate('composing', remoteJid);
         }
 
-        const response = await axios.post(endpoint, payload, {
+        const response = await circuitPost(endpoint, payload, {
           headers: {
             Authorization: `Bearer ${dify.apiKey}`,
           },
@@ -206,7 +207,7 @@ export class DifyService extends BaseChatbotService<Dify, DifySetting> {
           await instance.client.sendPresenceUpdate('composing', remoteJid);
         }
 
-        const response = await axios.post(endpoint, payload, {
+        const response = await circuitPost(endpoint, payload, {
           headers: {
             Authorization: `Bearer ${dify.apiKey}`,
           },
@@ -280,7 +281,7 @@ export class DifyService extends BaseChatbotService<Dify, DifySetting> {
           await instance.client.sendPresenceUpdate('composing', remoteJid);
         }
 
-        const response = await axios.post(endpoint, payload, {
+        const response = await circuitPost(endpoint, payload, {
           headers: {
             Authorization: `Bearer ${dify.apiKey}`,
           },

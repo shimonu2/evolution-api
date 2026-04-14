@@ -3,9 +3,9 @@ import { WAMonitoringService } from '@api/services/monitor.service';
 import { Events } from '@api/types/wa.types';
 import { Auth, ConfigService, HttpServer, Typebot } from '@config/env.config';
 import { Instance, IntegrationSession, Message, Typebot as TypebotModel } from '@prisma/client';
+import { circuitPost } from '@utils/circuitBreaker';
 import { getConversationMessage } from '@utils/getConversationMessage';
 import { sendTelemetry } from '@utils/sendTelemetry';
-import axios from 'axios';
 
 import { BaseChatbotService } from '../../base-chatbot.service';
 import { OpenaiService } from '../../openai/services/openai.service';
@@ -124,7 +124,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
           },
         };
       }
-      const request = await axios.post(url, reqData, { timeout: HTTP_TIMEOUT_MS });
+      const request = await circuitPost(url, reqData, { timeout: HTTP_TIMEOUT_MS });
 
       let session = null;
       if (request?.data?.sessionId) {
@@ -712,7 +712,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
               };
             }
 
-            const request = await axios.post(urlTypebot, reqData, { timeout: HTTP_TIMEOUT_MS });
+            const request = await circuitPost(urlTypebot, reqData, { timeout: HTTP_TIMEOUT_MS });
 
             await this.sendWAMessage(
               instance,
@@ -877,7 +877,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
               sessionId: data?.sessionId,
             };
           }
-          request = await axios.post(urlTypebot, reqData, { timeout: HTTP_TIMEOUT_MS });
+          request = await circuitPost(urlTypebot, reqData, { timeout: HTTP_TIMEOUT_MS });
 
           await this.sendWAMessage(
             instance,
@@ -999,7 +999,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
       }
     }
 
-    const request = await axios.post(urlTypebot, reqData, { timeout: HTTP_TIMEOUT_MS });
+    const request = await circuitPost(urlTypebot, reqData, { timeout: HTTP_TIMEOUT_MS });
 
     await this.sendWAMessage(
       instance,
