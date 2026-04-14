@@ -1,3 +1,66 @@
+# 2.3.8-robustness.0414.2 (2026-04-14)
+
+### Robustness Hardening — Part 2
+
+Follow-up to 0414 — closes the remaining audit items.
+
+**Data & correctness**
+* Replaced `$executeRawUnsafe` in Baileys label ops with idiomatic
+  `$executeRaw` tagged templates.
+* Untracked `.DS_Store` (was lingering in the index despite .gitignore).
+* Per-instance `saveCreds()` mutex so concurrent creds.update writes can't
+  interleave and corrupt auth state.
+
+**Log / IO hardening**
+* `console.log` in the Logger now goes through `safeLog()` — falls back to
+  stderr, silently drops on double-failure, so a broken stdout pipe can't
+  crash the process.
+* 60s `withTimeout()` wrapper around every S3/MinIO `putObject`,
+  `presignedGetObject`, `removeObject`. Tunable via `S3_TIMEOUT_MS`.
+
+**Baileys stability**
+* `ensureConnected()` pre-send guard: rejects immediately if the socket
+  isn't open (waits up to 5s). Stops silent "queued into the void" sends.
+* `sendWithRetry()` retries once on transport errors (`ECONNRESET`,
+  `ETIMEDOUT`, `WebSocket was closed`, `Connection Closed`, `Stream Errored`).
+  Never retries blindly — would cause double-sends.
+* Sequential status-broadcast batches with `STATUS_BATCH_DELAY_MS` (default
+  200ms) instead of `Promise.allSettled` parallel fire. Stops WhatsApp
+  from banning numbers that blast 100+ sends in a second.
+* Absolute `PAIRING_BUDGET_MS` (5min default) wall-clock budget on QR
+  pairing on top of the count limit.
+* Bounded OpenAI Assistant run polling by wall-clock (`OPENAI_ASSISTANT_BUDGET_MS`,
+  default 90s) with adaptive interval 1s → 5s.
+
+**Operational visibility**
+* Zombie instance detector: background interval that walks `waInstances`
+  and calls `reloadConnection()` on entries with `state=open` but no
+  `client.user`. Disable via `INSTANCE_HEALTHCHECK=false`.
+* Prometheus `/metrics` endpoint — default Node.js internals (CPU, GC,
+  event-loop lag) + custom gauges for instance state, messages sent,
+  chatbot calls, reconnect count. Disable via `METRICS=false`.
+* `ecosystem.config.js` for PM2 with `max_memory_restart: 1G`,
+  `kill_timeout: 30s`, exponential backoff on restart storms.
+
+**Integration resilience**
+* Per-endpoint circuit breaker (opossum) around all chatbot POST calls
+  (Dify, Flowise, N8N, Typebot, EvoAI, EvolutionBot). After 5 calls with
+  >50% error rate the breaker opens for 30s, then half-opens a probe.
+  4xx responses are excluded from the error count. Tunable / disable via
+  env.
+* RabbitMQ queues support an optional `RABBITMQ_MAX_QUEUE_LENGTH` with
+  `x-overflow=drop-head`, preventing unbounded growth when consumers lag.
+* SQS `sendMessage` converted from callback form to awaited
+  `SendMessageCommand` so `emit()` reflects actual send completion.
+* NATS now connects with `maxReconnectAttempts: -1` and 2s backoff,
+  observes status() + closed(), skips publish when `isClosed()`.
+
+**Security / deps**
+* npm audit: 66 → 5 findings (all dev-only commitizen transitives;
+  0 critical, no runtime impact). Added `overrides` for
+  `@figuro/chatwoot-sdk` → `axios ^1.14.1` to eliminate the critical
+  axios CVE chain and `brace-expansion ^2.0.3` for the ReDoS fix.
+
 # 2.3.8-robustness.0414 (2026-04-14)
 
 ### Robustness Hardening
