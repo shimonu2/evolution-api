@@ -1853,6 +1853,53 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  // Pre-send guard: refuse to hand a message to a dead socket. Baileys will
+  // silently queue writes when the WS is closed and the caller never finds
+  // out the message went nowhere. Wait briefly for open, then fail fast.
+  private async ensureConnected(timeoutMs = 5_000): Promise<void> {
+    if (this.stateConnection?.state === 'open' && this.client?.user) return;
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.stateConnection?.state === 'open' && this.client?.user) return;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    throw new BadRequestException(
+      `Instance "${this.instance.name}" is not connected (state=${this.stateConnection?.state ?? 'unknown'})`,
+    );
+  }
+
+  // Conservative retry: only retry on transport errors that clearly indicate
+  // the message did NOT reach the server (ECONNRESET, WebSocket closed).
+  // Never retry blind — duplicate sends are a worse bug than a lost one.
+  private async sendWithRetry<T>(op: () => Promise<T>, label: string, maxAttempts = 2): Promise<T> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.ensureConnected();
+        return await op();
+      } catch (err) {
+        lastErr = err;
+        const msg = (err as Error)?.message ?? '';
+        const isTransient =
+          msg.includes('ECONNRESET') ||
+          msg.includes('ETIMEDOUT') ||
+          msg.includes('WebSocket was closed') ||
+          msg.includes('Connection Closed') ||
+          msg.includes('Stream Errored');
+        if (!isTransient || attempt === maxAttempts) {
+          throw err;
+        }
+        const backoff = 500 * attempt;
+        this.logger.warn(
+          `sendMessage "${label}" transient failure (attempt ${attempt}): ${msg} — retry in ${backoff}ms`,
+        );
+        await new Promise((r) => setTimeout(r, backoff));
+      }
+    }
+    throw lastErr;
+  }
+
   private saveCredsSerialized(): Promise<void> {
     // Append to the chain; swallow rejections so one failing write doesn't
     // poison subsequent ones. Actual errors are logged inside runSafe.
@@ -2172,12 +2219,16 @@ export class BaileysStartupService extends ChannelStartupService {
       sender !== 'status@broadcast'
     ) {
       if (message['reactionMessage']) {
-        return await this.client.sendMessage(
-          sender,
-          {
-            react: { text: message['reactionMessage']['text'], key: message['reactionMessage']['key'] },
-          } as unknown as AnyMessageContent,
-          option as unknown as MiscMessageGenerationOptions,
+        return await this.sendWithRetry(
+          () =>
+            this.client.sendMessage(
+              sender,
+              {
+                react: { text: message['reactionMessage']['text'], key: message['reactionMessage']['key'] },
+              } as unknown as AnyMessageContent,
+              option as unknown as MiscMessageGenerationOptions,
+            ),
+          'reaction',
         );
       }
     }
@@ -2187,27 +2238,35 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (message['conversation']) {
-      return await this.client.sendMessage(
-        sender,
-        {
-          text: message['conversation'],
-          mentions,
-          linkPreview: linkPreview,
-          contextInfo: message['contextInfo'],
-        } as unknown as AnyMessageContent,
-        option as unknown as MiscMessageGenerationOptions,
+      return await this.sendWithRetry(
+        () =>
+          this.client.sendMessage(
+            sender,
+            {
+              text: message['conversation'],
+              mentions,
+              linkPreview: linkPreview,
+              contextInfo: message['contextInfo'],
+            } as unknown as AnyMessageContent,
+            option as unknown as MiscMessageGenerationOptions,
+          ),
+        'conversation',
       );
     }
 
     if (!message['audio'] && !message['poll'] && !message['sticker'] && sender != 'status@broadcast') {
-      return await this.client.sendMessage(
-        sender,
-        {
-          forward: { key: { remoteJid: this.instance.wuid, fromMe: true }, message },
-          mentions,
-          contextInfo: message['contextInfo'],
-        },
-        option as unknown as MiscMessageGenerationOptions,
+      return await this.sendWithRetry(
+        () =>
+          this.client.sendMessage(
+            sender,
+            {
+              forward: { key: { remoteJid: this.instance.wuid, fromMe: true }, message },
+              mentions,
+              contextInfo: message['contextInfo'],
+            },
+            option as unknown as MiscMessageGenerationOptions,
+          ),
+        'forward',
       );
     }
 
@@ -2271,10 +2330,14 @@ export class BaileysStartupService extends ChannelStartupService {
       return firstMessage;
     }
 
-    return await this.client.sendMessage(
-      sender,
-      message as unknown as AnyMessageContent,
-      option as unknown as MiscMessageGenerationOptions,
+    return await this.sendWithRetry(
+      () =>
+        this.client.sendMessage(
+          sender,
+          message as unknown as AnyMessageContent,
+          option as unknown as MiscMessageGenerationOptions,
+        ),
+      'default',
     );
   }
 
