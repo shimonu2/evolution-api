@@ -452,8 +452,16 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
-        this.client?.ws?.close();
-        this.client.end(new Error('Close connection'));
+        try {
+          this.client?.ws?.close();
+        } catch (e) {
+          this.logger.warn(`ws.close() failed: ${(e as Error)?.message ?? e}`);
+        }
+        try {
+          this.client?.end?.(new Error('Close connection'));
+        } catch (e) {
+          this.logger.warn(`client.end() failed: ${(e as Error)?.message ?? e}`);
+        }
 
         this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
       }
@@ -630,6 +638,20 @@ export class BaileysStartupService extends ChannelStartupService {
       },
     };
 
+    // Defensively close the previous socket before creating a new one.
+    // Baileys normally does this internally, but reconnect paths can race and
+    // leave a zombie socket holding the auth-state file lock.
+    if (this.client) {
+      try {
+        this.client.ev?.removeAllListeners?.('connection.update');
+        this.client.ws?.removeAllListeners?.();
+        this.client.ws?.close?.();
+        this.client.end?.(new Error('Creating new socket'));
+      } catch (e) {
+        this.logger.warn(`Previous-socket cleanup failed: ${(e as Error)?.message ?? e}`);
+      }
+    }
+
     // Create the socket with enhanced configuration
     const sock = makeWASocket({
       ...socketConfig,
@@ -639,30 +661,11 @@ export class BaileysStartupService extends ChannelStartupService {
       },
     });
 
-    // Add event listeners for connection state
-    sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect, qr } = update;
-
-      if (connection === 'close') {
-        const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== 401;
-        this.logger.warn(`Connection closed due to ${lastDisconnect?.error}, reconnecting ${shouldReconnect}`);
-
-        if (shouldReconnect) {
-          // Reconnect after a delay (human-like behavior)
-          const delay = Math.floor(Math.random() * 2000) + 1000; // 1-3 seconds
-          setTimeout(() => this.createClient(number), delay);
-        }
-      } else if (connection === 'open') {
-        this.logger.info('Successfully connected to WhatsApp Web');
-        this.logger.info(`Browser: Chrome 147.0.7727.55 Mobile (Android)`);
-        this.logger.info(`Language: en-US,en,he,ar`);
-        this.logger.info(`Timezone: Asia/Jerusalem`);
-      }
-
-      if (qr) {
-        this.logger.info('QR code received, please scan it');
-      }
-    });
+    // Note: connection.update is handled exclusively by connectionUpdate() via
+    // eventHandler() below. A second inline listener used to duplicate that
+    // logic with weaker reconnect criteria, which caused a race where two
+    // reconnects fired on every disconnect and corrupted auth state. Do not
+    // re-introduce an inline connection.update listener here.
 
     this.logger.info(`Using WhatsApp Web version: ${waVersion.version.join('.')}`);
     this.logger.info(`Group Ignore: ${this.localSettings?.groupsIgnore || 'not set'}`);
@@ -1849,138 +1852,139 @@ export class BaileysStartupService extends ChannelStartupService {
   private eventHandler() {
     this.client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
-        try {
-          if (!this.endSession) {
-            const database = this.configService.get<Database>('DATABASE');
-            const settings = await this.findSettings();
+        if (this.endSession) return;
 
-            if (events.call) {
-              const call = events.call[0];
-
-              if (settings?.rejectCall && call.status == 'offer') {
-                this.client.rejectCall(call.id, call.from);
-              }
-
-              if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-                if (call.from.endsWith('@lid')) {
-                  call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
-                }
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
-
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
-              }
-
-              this.sendDataWebhook(Events.CALL, call);
-            }
-
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
-            }
-
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
-            }
-
-            if (events['messaging-history.set']) {
-              const payload = events['messaging-history.set'];
-              await this.messageHandle['messaging-history.set'](payload);
-            }
-
-            if (events['messages.upsert']) {
-              const payload = events['messages.upsert'];
-
-              // this.messageProcessor.processMessage(payload, settings);
-              await this.messageHandle['messages.upsert'](payload, settings);
-            }
-
-            if (events['messages.update']) {
-              const payload = events['messages.update'];
-              await this.messageHandle['messages.update'](payload, settings);
-            }
-
-            if (events['message-receipt.update']) {
-              const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap: Record<string, number> = {};
-
-              for (const event of payload) {
-                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
-                }
-              }
-
-              await Promise.all(
-                Object.keys(remotesJidMap).map(async (remoteJid) =>
-                  this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-                ),
-              );
-            }
-
-            if (events['presence.update']) {
-              const payload = events['presence.update'];
-
-              if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
-                return;
-              }
-
-              this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-            }
-
-            if (!settings?.groupsIgnore) {
-              if (events['groups.upsert']) {
-                const payload = events['groups.upsert'];
-                this.groupHandler['groups.upsert'](payload);
-              }
-
-              if (events['groups.update']) {
-                const payload = events['groups.update'];
-                this.groupHandler['groups.update'](payload);
-              }
-
-              if (events['group-participants.update']) {
-                const payload = events['group-participants.update'] as any;
-                this.groupHandler['group-participants.update'](payload);
-              }
-            }
-
-            if (events['chats.upsert']) {
-              const payload = events['chats.upsert'];
-              this.chatHandle['chats.upsert'](payload);
-            }
-
-            if (events['chats.update']) {
-              const payload = events['chats.update'];
-              this.chatHandle['chats.update'](payload);
-            }
-
-            if (events['chats.delete']) {
-              const payload = events['chats.delete'];
-              this.chatHandle['chats.delete'](payload);
-            }
-
-            if (events['contacts.upsert']) {
-              const payload = events['contacts.upsert'];
-              this.contactHandle['contacts.upsert'](payload);
-            }
-
-            if (events['contacts.update']) {
-              const payload = events['contacts.update'];
-              this.contactHandle['contacts.update'](payload);
-            }
-
-            if (events[Events.LABELS_ASSOCIATION]) {
-              const payload = events[Events.LABELS_ASSOCIATION];
-              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-              return;
-            }
-
-            if (events[Events.LABELS_EDIT]) {
-              const payload = events[Events.LABELS_EDIT];
-              this.labelHandle[Events.LABELS_EDIT](payload);
-              return;
-            }
+        const instanceName = this.instance.name;
+        // Isolate each event branch so a thrown error from one handler cannot
+        // break the shared eventProcessingQueue for this instance — previously
+        // a failure in (say) messages.upsert would also skip every subsequent
+        // event in the same batch.
+        const runSafe = async (eventName: string, fn: () => void | Promise<unknown>) => {
+          try {
+            await fn();
+          } catch (error) {
+            this.logger.error({ eventName, instanceName, error });
           }
+        };
+
+        const database = this.configService.get<Database>('DATABASE');
+        let settings: any = null;
+        try {
+          settings = await this.findSettings();
         } catch (error) {
-          this.logger.error(error);
+          this.logger.error({ eventName: 'findSettings', instanceName, error });
+        }
+
+        if (events.call) {
+          await runSafe('call', async () => {
+            const call = events.call[0];
+
+            if (settings?.rejectCall && call.status == 'offer') {
+              this.client.rejectCall(call.id, call.from);
+            }
+
+            if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+              if (call.from.endsWith('@lid')) {
+                call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+              }
+              const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+
+              this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+            }
+
+            this.sendDataWebhook(Events.CALL, call);
+          });
+        }
+
+        if (events['connection.update']) {
+          await runSafe('connection.update', () => this.connectionUpdate(events['connection.update']));
+        }
+
+        if (events['creds.update']) {
+          await runSafe('creds.update', () => this.instance.authState.saveCreds());
+        }
+
+        if (events['messaging-history.set']) {
+          await runSafe('messaging-history.set', () =>
+            this.messageHandle['messaging-history.set'](events['messaging-history.set']),
+          );
+        }
+
+        if (events['messages.upsert']) {
+          await runSafe('messages.upsert', () =>
+            this.messageHandle['messages.upsert'](events['messages.upsert'], settings),
+          );
+        }
+
+        if (events['messages.update']) {
+          await runSafe('messages.update', () =>
+            this.messageHandle['messages.update'](events['messages.update'], settings),
+          );
+        }
+
+        if (events['message-receipt.update']) {
+          await runSafe('message-receipt.update', async () => {
+            const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
+            const remotesJidMap: Record<string, number> = {};
+
+            for (const event of payload) {
+              if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+                remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+              }
+            }
+
+            await Promise.all(
+              Object.keys(remotesJidMap).map((remoteJid) =>
+                this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+              ),
+            );
+          });
+        }
+
+        if (events['presence.update']) {
+          await runSafe('presence.update', () => {
+            const payload = events['presence.update'];
+            if (settings?.groupsIgnore && payload.id.includes('@g.us')) return;
+            this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+          });
+        }
+
+        if (!settings?.groupsIgnore) {
+          if (events['groups.upsert']) {
+            await runSafe('groups.upsert', () => this.groupHandler['groups.upsert'](events['groups.upsert']));
+          }
+          if (events['groups.update']) {
+            await runSafe('groups.update', () => this.groupHandler['groups.update'](events['groups.update']));
+          }
+          if (events['group-participants.update']) {
+            await runSafe('group-participants.update', () =>
+              this.groupHandler['group-participants.update'](events['group-participants.update'] as any),
+            );
+          }
+        }
+
+        if (events['chats.upsert']) {
+          await runSafe('chats.upsert', () => this.chatHandle['chats.upsert'](events['chats.upsert']));
+        }
+        if (events['chats.update']) {
+          await runSafe('chats.update', () => this.chatHandle['chats.update'](events['chats.update']));
+        }
+        if (events['chats.delete']) {
+          await runSafe('chats.delete', () => this.chatHandle['chats.delete'](events['chats.delete']));
+        }
+        if (events['contacts.upsert']) {
+          await runSafe('contacts.upsert', () => this.contactHandle['contacts.upsert'](events['contacts.upsert']));
+        }
+        if (events['contacts.update']) {
+          await runSafe('contacts.update', () => this.contactHandle['contacts.update'](events['contacts.update']));
+        }
+        if (events[Events.LABELS_ASSOCIATION]) {
+          await runSafe(Events.LABELS_ASSOCIATION, () =>
+            this.labelHandle[Events.LABELS_ASSOCIATION](events[Events.LABELS_ASSOCIATION], database),
+          );
+        }
+        if (events[Events.LABELS_EDIT]) {
+          await runSafe(Events.LABELS_EDIT, () => this.labelHandle[Events.LABELS_EDIT](events[Events.LABELS_EDIT]));
         }
       });
     });
