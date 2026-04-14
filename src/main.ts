@@ -30,6 +30,8 @@ async function initWA() {
   await waMonitor.loadInstance();
 }
 
+const errorWebhookClient = axios.create({ timeout: 5_000 });
+
 async function bootstrap() {
   const logger = new Logger('SERVER');
   const app = express();
@@ -59,8 +61,8 @@ async function bootstrap() {
       methods: [...configService.get<Cors>('CORS').METHODS],
       credentials: configService.get<Cors>('CORS').CREDENTIALS,
     }),
-    urlencoded({ extended: true, limit: '136mb' }),
-    json({ limit: '136mb' }),
+    urlencoded({ extended: true, limit: '5mb' }),
+    json({ limit: '5mb' }),
     compression(),
   );
 
@@ -101,10 +103,9 @@ async function bootstrap() {
 
           logger.error(errorData);
 
-          const baseURL = webhook.EVENTS.ERRORS_WEBHOOK;
-          const httpService = axios.create({ baseURL });
-
-          httpService.post('', errorData);
+          errorWebhookClient
+            .post(webhook.EVENTS.ERRORS_WEBHOOK, errorData)
+            .catch((hookErr) => logger.error(`Error webhook delivery failed: ${hookErr?.message}`));
         }
 
         return res.status(err['status'] || 500).json({
@@ -156,6 +157,11 @@ async function bootstrap() {
     // but before any and other error-handling middlewares are defined
     Sentry.setupExpressErrorHandler(app);
   }
+
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
+  server.requestTimeout = 120_000;
+  server.maxConnections = 10_000;
 
   server.listen(httpServer.PORT, () => logger.log(httpServer.TYPE.toUpperCase() + ' - ON: ' + httpServer.PORT));
 
