@@ -13,6 +13,8 @@ import P from 'pino';
 
 import { BaseChatbotService } from '../../base-chatbot.service';
 
+const HTTP_TIMEOUT_MS = 30_000;
+
 /**
  * OpenAI service that extends the common BaseChatbotService
  * Handles both Assistant API and ChatCompletion API
@@ -35,7 +37,7 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
    * Initialize the OpenAI client with the provided API key
    */
   protected initClient(apiKey: string) {
-    this.client = new OpenAI({ apiKey });
+    this.client = new OpenAI({ apiKey, timeout: HTTP_TIMEOUT_MS });
     return this.client;
   }
 
@@ -287,7 +289,10 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
         let mediaBase64 = msg.message.base64 || null;
 
         if (msg.message.mediaUrl && isURL(msg.message.mediaUrl)) {
-          const result = await axios.get(msg.message.mediaUrl, { responseType: 'arraybuffer' });
+          const result = await axios.get(msg.message.mediaUrl, {
+            responseType: 'arraybuffer',
+            timeout: HTTP_TIMEOUT_MS,
+          });
           mediaBase64 = Buffer.from(result.data).toString('base64');
         }
 
@@ -621,10 +626,14 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
               payloadData.remoteJid = remoteJid;
               payloadData.pushName = pushName;
 
-              const response = await axios.post(functionUrl, {
-                functionName: toolCall.function.name,
-                functionArguments: payloadData,
-              });
+              const response = await axios.post(
+                functionUrl,
+                {
+                  functionName: toolCall.function.name,
+                  functionArguments: payloadData,
+                },
+                { timeout: HTTP_TIMEOUT_MS },
+              );
 
               toolOutputs.push({
                 tool_call_id: toolCall.id,
@@ -693,9 +702,11 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
     let audio: Buffer;
 
     if (msg.message.mediaUrl) {
-      audio = await axios.get(msg.message.mediaUrl, { responseType: 'arraybuffer' }).then((response) => {
-        return Buffer.from(response.data, 'binary');
-      });
+      audio = await axios
+        .get(msg.message.mediaUrl, { responseType: 'arraybuffer', timeout: HTTP_TIMEOUT_MS })
+        .then((response) => {
+          return Buffer.from(response.data, 'binary');
+        });
     } else if (msg.message.base64) {
       audio = Buffer.from(msg.message.base64, 'base64');
     } else {
@@ -727,6 +738,7 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
         'Content-Type': 'multipart/form-data',
         Authorization: `Bearer ${apiKey}`,
       },
+      timeout: HTTP_TIMEOUT_MS,
     });
 
     return response?.data?.text;

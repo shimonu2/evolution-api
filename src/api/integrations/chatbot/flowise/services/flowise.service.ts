@@ -10,6 +10,8 @@ import { isURL } from 'class-validator';
 import { BaseChatbotService } from '../../base-chatbot.service';
 import { OpenaiService } from '../../openai/services/openai.service';
 
+const HTTP_TIMEOUT_MS = 30_000;
+
 export class FlowiseService extends BaseChatbotService<FlowiseModel> {
   private openaiService: OpenaiService;
 
@@ -132,6 +134,7 @@ export class FlowiseService extends BaseChatbotService<FlowiseModel> {
 
     const response = await axios.post(endpoint, payload, {
       headers,
+      timeout: HTTP_TIMEOUT_MS,
     });
 
     if (instance.integration === Integration.WHATSAPP_BAILEYS) {

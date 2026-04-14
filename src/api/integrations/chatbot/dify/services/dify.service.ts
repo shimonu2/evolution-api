@@ -9,6 +9,8 @@ import { isURL } from 'class-validator';
 import { BaseChatbotService } from '../../base-chatbot.service';
 import { OpenaiService } from '../../openai/services/openai.service';
 
+const HTTP_TIMEOUT_MS = 30_000;
+
 export class DifyService extends BaseChatbotService<Dify, DifySetting> {
   private openaiService: OpenaiService;
 
@@ -85,7 +87,10 @@ export class DifyService extends BaseChatbotService<Dify, DifySetting> {
             let mediaBase64 = msg.message.base64 || null;
 
             if (msg.message.mediaUrl && isURL(msg.message.mediaUrl)) {
-              const result = await axios.get(msg.message.mediaUrl, { responseType: 'arraybuffer' });
+              const result = await axios.get(msg.message.mediaUrl, {
+                responseType: 'arraybuffer',
+                timeout: HTTP_TIMEOUT_MS,
+              });
               mediaBase64 = Buffer.from(result.data).toString('base64');
             }
 
@@ -119,6 +124,7 @@ export class DifyService extends BaseChatbotService<Dify, DifySetting> {
           headers: {
             Authorization: `Bearer ${dify.apiKey}`,
           },
+          timeout: HTTP_TIMEOUT_MS,
         });
 
         if (instance.integration === Integration.WHATSAPP_BAILEYS)
@@ -167,7 +173,10 @@ export class DifyService extends BaseChatbotService<Dify, DifySetting> {
             let mediaBase64 = msg.message.base64 || null;
 
             if (msg.message.mediaUrl && isURL(msg.message.mediaUrl)) {
-              const result = await axios.get(msg.message.mediaUrl, { responseType: 'arraybuffer' });
+              const result = await axios.get(msg.message.mediaUrl, {
+                responseType: 'arraybuffer',
+                timeout: HTTP_TIMEOUT_MS,
+              });
               mediaBase64 = Buffer.from(result.data).toString('base64');
             }
 
@@ -201,6 +210,7 @@ export class DifyService extends BaseChatbotService<Dify, DifySetting> {
           headers: {
             Authorization: `Bearer ${dify.apiKey}`,
           },
+          timeout: HTTP_TIMEOUT_MS,
         });
 
         if (instance.integration === Integration.WHATSAPP_BAILEYS)
@@ -274,6 +284,7 @@ export class DifyService extends BaseChatbotService<Dify, DifySetting> {
           headers: {
             Authorization: `Bearer ${dify.apiKey}`,
           },
+          timeout: HTTP_TIMEOUT_MS,
         });
 
         let conversationId;

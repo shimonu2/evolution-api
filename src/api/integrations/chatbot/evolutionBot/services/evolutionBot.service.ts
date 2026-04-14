@@ -11,6 +11,8 @@ import { isURL } from 'class-validator';
 import { BaseChatbotService } from '../../base-chatbot.service';
 import { OpenaiService } from '../../openai/services/openai.service';
 
+const HTTP_TIMEOUT_MS = 30_000;
+
 export class EvolutionBotService extends BaseChatbotService<EvolutionBot, EvolutionBotSetting> {
   private openaiService: OpenaiService;
 
@@ -128,6 +130,7 @@ export class EvolutionBotService extends BaseChatbotService<EvolutionBot, Evolut
 
       const response = await axios.post(endpoint, payload, {
         headers,
+        timeout: HTTP_TIMEOUT_MS,
       });
 
       if (instance.integration === Integration.WHATSAPP_BAILEYS) {

@@ -10,6 +10,8 @@ import axios from 'axios';
 import { BaseChatbotService } from '../../base-chatbot.service';
 import { OpenaiService } from '../../openai/services/openai.service';
 
+const HTTP_TIMEOUT_MS = 30_000;
+
 export class TypebotService extends BaseChatbotService<TypebotModel, any> {
   private openaiService: OpenaiService;
 
@@ -122,7 +124,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
           },
         };
       }
-      const request = await axios.post(url, reqData);
+      const request = await axios.post(url, reqData, { timeout: HTTP_TIMEOUT_MS });
 
       let session = null;
       if (request?.data?.sessionId) {
@@ -710,7 +712,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
               };
             }
 
-            const request = await axios.post(urlTypebot, reqData);
+            const request = await axios.post(urlTypebot, reqData, { timeout: HTTP_TIMEOUT_MS });
 
             await this.sendWAMessage(
               instance,
@@ -875,7 +877,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
               sessionId: data?.sessionId,
             };
           }
-          request = await axios.post(urlTypebot, reqData);
+          request = await axios.post(urlTypebot, reqData, { timeout: HTTP_TIMEOUT_MS });
 
           await this.sendWAMessage(
             instance,
@@ -997,7 +999,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
       }
     }
 
-    const request = await axios.post(urlTypebot, reqData);
+    const request = await axios.post(urlTypebot, reqData, { timeout: HTTP_TIMEOUT_MS });
 
     await this.sendWAMessage(
       instance,
