@@ -241,6 +241,10 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private authStateProvider: AuthStateProvider;
+  // Promise-chain mutex: serializes saveCreds() calls per instance so two
+  // creds.update events arriving back-to-back (common during multidevice
+  // sync) cannot interleave their writes and corrupt the auth state.
+  private saveCredsChain: Promise<void> = Promise.resolve();
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
@@ -1849,6 +1853,16 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  private saveCredsSerialized(): Promise<void> {
+    // Append to the chain; swallow rejections so one failing write doesn't
+    // poison subsequent ones. Actual errors are logged inside runSafe.
+    this.saveCredsChain = this.saveCredsChain.then(
+      () => this.instance.authState?.saveCreds?.() ?? Promise.resolve(),
+      () => this.instance.authState?.saveCreds?.() ?? Promise.resolve(),
+    );
+    return this.saveCredsChain;
+  }
+
   private eventHandler() {
     this.client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
@@ -1901,7 +1915,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         if (events['creds.update']) {
-          await runSafe('creds.update', () => this.instance.authState.saveCreds());
+          await runSafe('creds.update', () => this.saveCredsSerialized());
         }
 
         if (events['messaging-history.set']) {
