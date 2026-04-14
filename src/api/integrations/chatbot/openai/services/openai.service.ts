@@ -599,17 +599,25 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
   ) {
     let status = await this.client.beta.threads.runs.retrieve(threadId, runId);
 
-    let maxRetries = 60; // 1 minute with 1s intervals
-    const checkInterval = 1000; // 1 second
+    // Bound by wall-clock time, not iteration count — otherwise a sluggish
+    // OpenAI API combined with the 30s per-call SDK timeout could stack up to
+    // 30min per assistant run. Default 90s; overridable via env.
+    const runBudgetMs = Number(process.env.OPENAI_ASSISTANT_BUDGET_MS ?? 90_000);
+    const deadline = Date.now() + runBudgetMs;
+    const initialInterval = 1_000;
+    const maxInterval = 5_000;
 
     while (
       status.status !== 'completed' &&
       status.status !== 'failed' &&
       status.status !== 'cancelled' &&
       status.status !== 'expired' &&
-      maxRetries > 0
+      Date.now() < deadline
     ) {
-      await new Promise((resolve) => setTimeout(resolve, checkInterval));
+      // Back off polling interval so we don't hammer the API when the run is slow.
+      const elapsed = runBudgetMs - (deadline - Date.now());
+      const interval = Math.min(initialInterval + Math.floor(elapsed / 10_000) * 1_000, maxInterval);
+      await new Promise((resolve) => setTimeout(resolve, interval));
       status = await this.client.beta.threads.runs.retrieve(threadId, runId);
 
       // Handle tool calls
@@ -658,8 +666,6 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
           tool_outputs: toolOutputs,
         });
       }
-
-      maxRetries--;
     }
 
     if (status.status === 'completed') {
