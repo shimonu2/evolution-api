@@ -64,6 +64,12 @@
       "path": "cz-conventional-changelog"
     }
   },
+  "overrides": {
+    "@figuro/chatwoot-sdk": {
+      "axios": "^1.14.1"
+    },
+    "brace-expansion": "^2.0.3"
+  },
   "dependencies": {
     "@adiwajshing/keyed-db": "^0.2.4",
     "@aws-sdk/client-sqs": "^3.891.0",
