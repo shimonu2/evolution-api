@@ -1,7 +1,13 @@
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
-import { CreateQueueCommand, DeleteQueueCommand, ListQueuesCommand, SQS } from '@aws-sdk/client-sqs';
+import {
+  CreateQueueCommand,
+  DeleteQueueCommand,
+  ListQueuesCommand,
+  SendMessageCommand,
+  SQS,
+} from '@aws-sdk/client-sqs';
 import { configService, HttpServer, Log, S3, Sqs } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 
@@ -178,29 +184,28 @@ export class SqsController extends EventController implements EventControllerInt
           }),
         };
 
-        this.sqs.sendMessage(params, (err) => {
-          if (err) {
-            this.logger.error({
-              local: `${origin}.sendData-SQS`,
-              params: JSON.stringify(message),
-              sqsUrl: sqsUrl,
-              message: err?.message,
-              hostName: err?.hostname,
-              code: err?.code,
-              stack: err?.stack,
-              name: err?.name,
-              url: queueName,
-              server_url: serverUrl,
-            });
-          } else if (configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS')) {
-            const logData = {
+        try {
+          await this.sqs.send(new SendMessageCommand(params));
+          if (configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS')) {
+            this.logger.log({
               local: `${origin}.sendData-SQS`,
               ...message,
-            };
-
-            this.logger.log(logData);
+            });
           }
-        });
+        } catch (err: any) {
+          this.logger.error({
+            local: `${origin}.sendData-SQS`,
+            params: JSON.stringify(message),
+            sqsUrl: sqsUrl,
+            message: err?.message,
+            hostName: err?.hostname,
+            code: err?.code,
+            stack: err?.stack,
+            name: err?.name,
+            url: queueName,
+            server_url: serverUrl,
+          });
+        }
       }
     }
   }
