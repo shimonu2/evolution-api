@@ -4757,49 +4757,41 @@ export class BaileysStartupService extends ChannelStartupService {
   private async addLabel(labelId: string, instanceId: string, chatId: string) {
     const id = cuid();
 
-    await this.prismaRepository.$executeRawUnsafe(
-      `INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
-       VALUES ($4, $2, $3, to_jsonb(ARRAY[$1]::text[]), NOW(), NOW()) ON CONFLICT ("instanceId", "remoteJid")
-     DO
-      UPDATE
-          SET "labels" = (
+    await this.prismaRepository.$executeRaw`
+      INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
+      VALUES (${id}, ${instanceId}, ${chatId}, to_jsonb(ARRAY[${labelId}]::text[]), NOW(), NOW())
+      ON CONFLICT ("instanceId", "remoteJid")
+      DO UPDATE
+        SET "labels" = (
           SELECT to_jsonb(array_agg(DISTINCT elem))
           FROM (
-          SELECT jsonb_array_elements_text("Chat"."labels") AS elem
-          UNION
-          SELECT $1::text AS elem
+            SELECT jsonb_array_elements_text("Chat"."labels") AS elem
+            UNION
+            SELECT ${labelId}::text AS elem
           ) sub
-          ),
-          "updatedAt" = NOW();`,
-      labelId,
-      instanceId,
-      chatId,
-      id,
-    );
+        ),
+        "updatedAt" = NOW();
+    `;
   }
 
   private async removeLabel(labelId: string, instanceId: string, chatId: string) {
     const id = cuid();
 
-    await this.prismaRepository.$executeRawUnsafe(
-      `INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
-       VALUES ($4, $2, $3, '[]'::jsonb, NOW(), NOW()) ON CONFLICT ("instanceId", "remoteJid")
-     DO
-      UPDATE
-          SET "labels" = COALESCE (
+    await this.prismaRepository.$executeRaw`
+      INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
+      VALUES (${id}, ${instanceId}, ${chatId}, '[]'::jsonb, NOW(), NOW())
+      ON CONFLICT ("instanceId", "remoteJid")
+      DO UPDATE
+        SET "labels" = COALESCE(
           (
-          SELECT jsonb_agg(elem)
-          FROM jsonb_array_elements_text("Chat"."labels") AS elem
-          WHERE elem <> $1
+            SELECT jsonb_agg(elem)
+            FROM jsonb_array_elements_text("Chat"."labels") AS elem
+            WHERE elem <> ${labelId}
           ),
           '[]'::jsonb
-          ),
-          "updatedAt" = NOW();`,
-      labelId,
-      instanceId,
-      chatId,
-      id,
-    );
+        ),
+        "updatedAt" = NOW();
+    `;
   }
 
   public async baileysOnWhatsapp(jid: string) {
