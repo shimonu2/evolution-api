@@ -6,6 +6,7 @@ import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { HttpStatus, router } from '@api/routes/index.router';
 import { eventManager, waMonitor } from '@api/server.module';
+import { redisClient } from '@cache/rediscache.client';
 import {
   Auth,
   configService,
@@ -170,6 +171,63 @@ async function bootstrap() {
   });
 
   onUnexpectedError();
+  registerShutdownHandlers({ server, prismaRepository, logger });
+}
+
+interface ShutdownContext {
+  server: { close: (cb?: (err?: Error) => void) => void };
+  prismaRepository: PrismaRepository;
+  logger: Logger;
+}
+
+// 30s is the default K8s terminationGracePeriodSeconds — be slightly under it.
+const SHUTDOWN_TIMEOUT_MS = 25_000;
+
+function registerShutdownHandlers({ server, prismaRepository, logger }: ShutdownContext) {
+  let shuttingDown = false;
+
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) {
+      logger.warn(`Received ${signal} during shutdown; forcing exit.`);
+      process.exit(1);
+    }
+    shuttingDown = true;
+    logger.warn(`Received ${signal}, starting graceful shutdown (max ${SHUTDOWN_TIMEOUT_MS}ms)...`);
+
+    const forceExit = setTimeout(() => {
+      logger.error('Graceful shutdown timed out — forcing exit.');
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    forceExit.unref();
+
+    try {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      logger.info('HTTP server closed.');
+
+      await Promise.allSettled(
+        Object.entries(waMonitor.waInstances ?? {}).map(async ([name, inst]) => {
+          try {
+            inst?.client?.ws?.close?.();
+            await inst?.client?.end?.(undefined);
+          } catch (e) {
+            logger.error(`Failed to close instance "${name}": ${(e as Error)?.message ?? e}`);
+          }
+        }),
+      );
+      logger.info('Baileys instances closed.');
+
+      await prismaRepository.onModuleDestroy();
+      await redisClient.disconnect();
+      logger.info('Shutdown complete.');
+      process.exit(0);
+    } catch (e) {
+      logger.error(`Shutdown error: ${(e as Error)?.message ?? e}`);
+      process.exit(1);
+    }
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 bootstrap();
