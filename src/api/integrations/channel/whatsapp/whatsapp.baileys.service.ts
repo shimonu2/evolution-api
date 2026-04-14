@@ -330,11 +330,31 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
+  // Absolute wall-clock budget for one pairing attempt. Without it, an
+  // abandoned session (browser closed, user walked away) keeps generating QRs
+  // and requesting pairing codes until it hits the count LIMIT — potentially
+  // hours if LIMIT is high. Resets on successful connection.
+  private pairingStartedAt: number | null = null;
+  private readonly PAIRING_BUDGET_MS = Number(process.env.PAIRING_BUDGET_MS ?? 5 * 60_000);
+
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
     if (qr) {
-      if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
+      // Start the pairing clock on the first QR of an attempt.
+      if (this.pairingStartedAt === null) {
+        this.pairingStartedAt = Date.now();
+      }
+
+      const pairingElapsed = Date.now() - this.pairingStartedAt;
+      const countLimit = this.configService.get<QrCode>('QRCODE').LIMIT;
+      const budgetExceeded = pairingElapsed >= this.PAIRING_BUDGET_MS;
+
+      if (this.instance.qrcode.count === countLimit || budgetExceeded) {
+        const reason = budgetExceeded
+          ? `pairing budget exceeded (${pairingElapsed}ms ≥ ${this.PAIRING_BUDGET_MS}ms)`
+          : 'QR code limit reached, please login again';
+        this.logger.warn(`Abandoning pairing for instance "${this.instance.name}": ${reason}`);
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
-          message: 'QR code limit reached, please login again',
+          message: reason,
           statusCode: DisconnectReason.badSession,
         });
 
@@ -342,7 +362,7 @@ export class BaileysStartupService extends ChannelStartupService {
           this.chatwootService.eventWhatsapp(
             Events.QRCODE_UPDATED,
             { instanceName: this.instance.name, instanceId: this.instanceId },
-            { message: 'QR code limit reached, please login again', statusCode: DisconnectReason.badSession },
+            { message: reason, statusCode: DisconnectReason.badSession },
           );
         }
 
@@ -472,6 +492,9 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      // Reset the pairing clock on successful connection so the next
+      // disconnect-then-pair cycle starts fresh.
+      this.pairingStartedAt = null;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
