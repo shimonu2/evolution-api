@@ -2310,9 +2310,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if (batches.length === 0) return firstMessage;
 
-      await Promise.allSettled(
-        batches.map(async (batch) => {
-          const messageSent = await this.client.sendMessage(
+      // Send status batches sequentially with an inter-batch delay instead of
+      // a parallel Promise.allSettled. Fanning 100+ sends in parallel is a
+      // reliable way to trip WhatsApp's spam heuristics and get the number
+      // banned. Default rate ≈ 5 batches/sec; tune via STATUS_BATCH_DELAY_MS.
+      const interBatchDelay = Number(process.env.STATUS_BATCH_DELAY_MS ?? 200);
+      for (const batch of batches) {
+        try {
+          await this.client.sendMessage(
             sender,
             message['status'].content as unknown as AnyMessageContent,
             {
@@ -2322,10 +2327,11 @@ export class BaileysStartupService extends ChannelStartupService {
               messageId: msgId,
             } as unknown as MiscMessageGenerationOptions,
           );
-
-          return messageSent;
-        }),
-      );
+        } catch (err) {
+          this.logger.error(`Status batch send failed (batch size=${batch.length}): ${(err as Error)?.message ?? err}`);
+        }
+        if (interBatchDelay > 0) await new Promise((r) => setTimeout(r, interBatchDelay));
+      }
 
       return firstMessage;
     }
