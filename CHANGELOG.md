@@ -1,3 +1,53 @@
+# 2.3.8-robustness.0414 (2026-04-14)
+
+### Robustness Hardening
+
+Non-feature release focused on preventing hangs, crashes, and resource leaks
+observed in long-running multi-instance deployments.
+
+**HTTP / bootstrap**
+* Set `keepAliveTimeout`, `headersTimeout`, `requestTimeout`, `maxConnections`
+  on the HTTP server to prevent socket / file-descriptor exhaustion.
+* Dropped JSON and urlencoded body limits from 136 MB to 5 MB to prevent
+  single-request OOM.
+* Fixed axios-instance leak and swallowed rejection in the error-webhook path.
+* Added `helmet()`, `express-rate-limit` (600 req/min per IP, tunable),
+  and `trust proxy` for correct client-IP keying behind an LB.
+* Added `/health/live` and `/health/ready` (DB ping) endpoints for K8s probes.
+
+**Graceful shutdown**
+* `SIGTERM` / `SIGINT` handlers close HTTP server, all Baileys sockets,
+  Prisma, and Redis before exiting. 25s force-exit fallback.
+* `uncaughtException` now reports to Sentry and exits(1) so the process
+  manager can restart into a clean state. Override via `EXIT_ON_UNCAUGHT=false`.
+* `unhandledRejection` reports to Sentry without exiting.
+
+**Database (Prisma)**
+* Added connection pool (`connection_limit=20`, tunable), `connect_timeout`,
+  `pool_timeout`, and Postgres `statement_timeout=15s` via URL params.
+* Pipes Prisma's own warn/error events into the app logger.
+
+**Cache (Redis)**
+* Real reconnect strategy (progressive backoff, up to 20 attempts).
+* 5s connect timeout.
+* Fixed bug that set `connected=true` before `connect()` resolved.
+* Added `disconnect()` for graceful shutdown.
+
+**WhatsApp (Baileys)**
+* Removed duplicate inline `connection.update` listener in `createClient()`
+  that raced with `connectionUpdate()` and caused zombie instances and
+  occasional auth-state corruption on disconnect.
+* Defensive cleanup of previous socket listeners before creating a new one.
+* Isolated each event branch in `eventHandler()` with per-branch try/catch
+  so a throw in one handler no longer skips the rest of the batch.
+* Wrapped unguarded `client.end()` in the close path.
+
+**Chatbot integrations**
+* Added 30s timeouts to all outbound axios calls and the OpenAI SDK client
+  (OpenAI, Dify, Flowise, N8N, Typebot, EvoAI, EvolutionBot, Whisper, and
+  media downloads). A stuck upstream can no longer freeze message
+  processing for an instance indefinitely.
+
 # 2.3.7 (2025-12-05)
 
 ### Features
