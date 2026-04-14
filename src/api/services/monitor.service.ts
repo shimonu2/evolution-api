@@ -31,6 +31,43 @@ export class WAMonitoringService {
     Object.assign(this.redis, configService.get<CacheConf>('CACHE'));
 
     (this as any).providerSession = Object.freeze(configService.get<ProviderSession>('PROVIDER'));
+
+    this.startZombieDetector();
+  }
+
+  // Periodically check whether any instance is marked "open" but its socket
+  // is actually dead (client/user missing, or connection status mismatch).
+  // Baileys' internal detection can be slow — we've seen instances silently
+  // accept sends against a zombied socket for minutes before the lib notices.
+  // Disable with INSTANCE_HEALTHCHECK=false; tune cadence via _INTERVAL_MS.
+  private zombieInterval: NodeJS.Timeout | null = null;
+  private startZombieDetector() {
+    if (process.env.INSTANCE_HEALTHCHECK === 'false') return;
+    const intervalMs = Number(process.env.INSTANCE_HEALTHCHECK_INTERVAL_MS ?? 60_000);
+    this.zombieInterval = setInterval(() => {
+      for (const [name, inst] of Object.entries(this.waInstances)) {
+        try {
+          const state = inst?.stateConnection?.state ?? inst?.connectionStatus?.state;
+          const hasUser = !!inst?.client?.user;
+          if (state === 'open' && !hasUser) {
+            this.logger.warn(`Zombie instance detected ("${name}" state=open but no client.user) — reloading`);
+            inst.reloadConnection?.().catch((err: unknown) => {
+              this.logger.error(`Zombie reload failed for "${name}": ${(err as Error)?.message ?? err}`);
+            });
+          }
+        } catch (err) {
+          this.logger.error(`Zombie detector error for "${name}": ${(err as Error)?.message ?? err}`);
+        }
+      }
+    }, intervalMs);
+    this.zombieInterval.unref();
+  }
+
+  public stopZombieDetector() {
+    if (this.zombieInterval) {
+      clearInterval(this.zombieInterval);
+      this.zombieInterval = null;
+    }
   }
 
   private readonly db: Partial<Database> = {};

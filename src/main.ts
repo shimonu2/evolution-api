@@ -249,6 +249,8 @@ function registerShutdownHandlers({ server, prismaRepository, logger }: Shutdown
     forceExit.unref();
 
     try {
+      waMonitor.stopZombieDetector?.();
+
       await new Promise<void>((resolve) => server.close(() => resolve()));
       logger.info('HTTP server closed.');
 
