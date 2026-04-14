@@ -25,6 +25,8 @@ import axios from 'axios';
 import compression from 'compression';
 import cors from 'cors';
 import express, { json, NextFunction, Request, Response, urlencoded } from 'express';
+import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
 import { join } from 'path';
 
 async function initWA() {
@@ -46,6 +48,52 @@ async function bootstrap() {
 
   const prismaRepository = new PrismaRepository(configService);
   await prismaRepository.onModuleInit();
+
+  // Trust the first proxy hop so req.ip reflects the real client when running
+  // behind a load balancer (nginx, ALB, Cloud Run). Required for reliable
+  // rate-limit keying and accurate logging.
+  app.set('trust proxy', 1);
+
+  // /health must be reachable without auth so K8s/LB probes don't get blocked
+  // by rate limiting or apikey middleware. Keep it cheap — a DB ping gates
+  // readiness, a simple ack gates liveness.
+  app.get('/health/live', (_req, res) => res.status(200).json({ status: 'ok' }));
+  app.get('/health/ready', async (_req, res) => {
+    try {
+      await prismaRepository.$queryRaw`SELECT 1`;
+      res.status(200).json({ status: 'ready' });
+    } catch (e) {
+      res.status(503).json({ status: 'unavailable', error: (e as Error)?.message });
+    }
+  });
+
+  app.use(
+    helmet({
+      // Contact is a JSON API; CSP has no meaningful target. Keep it off to
+      // avoid unexpected interference with served static assets (/public).
+      contentSecurityPolicy: false,
+      // Evolution API is frequently fronted by gateways with their own HSTS
+      // policy; don't force one here.
+      hsts: false,
+    }),
+  );
+
+  // Rate limit — keep generous to avoid breaking legitimate bursty WA traffic,
+  // but deflect naive DoS. Operators can override via env.
+  const rateLimitMax = Number(process.env.RATE_LIMIT_MAX ?? 600);
+  const rateLimitWindowMs = Number(process.env.RATE_LIMIT_WINDOW_MS ?? 60_000);
+  if (rateLimitMax > 0) {
+    app.use(
+      rateLimit({
+        windowMs: rateLimitWindowMs,
+        max: rateLimitMax,
+        standardHeaders: 'draft-7',
+        legacyHeaders: false,
+        // Never rate-limit health probes
+        skip: (req) => req.path.startsWith('/health'),
+      }),
+    );
+  }
 
   app.use(
     cors({
