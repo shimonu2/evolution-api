@@ -1917,7 +1917,13 @@ export class BaileysStartupService extends ChannelStartupService {
   // Pre-send guard: refuse to hand a message to a dead socket. Baileys will
   // silently queue writes when the WS is closed and the caller never finds
   // out the message went nowhere. Wait briefly for open, then fail fast.
+  //
+  // Backwards-compat opt-out: ENSURE_CONNECTED_ON_SEND=false restores the
+  // pre-0414 behavior of letting Baileys silently queue against a dead
+  // socket. Only set this if your callers were previously relying on
+  // "fire and pray" semantics and you can't change them.
   private async ensureConnected(timeoutMs = 5_000): Promise<void> {
+    if (process.env.ENSURE_CONNECTED_ON_SEND === 'false') return;
     if (this.stateConnection?.state === 'open' && this.client?.user) return;
 
     const deadline = Date.now() + timeoutMs;
@@ -4421,6 +4427,15 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   // Group
+  // Per-instance group-metadata cache key. The underlying CacheService is
+  // shared (one Redis namespace), but two Baileys instances can be members
+  // of the same WA group with different membership / admin views, so a
+  // bare groupJid key would let them overwrite each other's metadata.
+  // Scope keys with the instance id.
+  private groupCacheKey(groupJid: string): string {
+    return `${this.instanceId}:${groupJid}`;
+  }
+
   private async updateGroupMetadataCache(groupJid: string) {
     try {
       const meta = await this.client.groupMetadata(groupJid);
@@ -4429,7 +4444,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
         this.logger.verbose(`Updating cache for group: ${groupJid}`);
-        await groupMetadataCache.set(groupJid, { timestamp: Date.now(), data: meta });
+        await groupMetadataCache.set(this.groupCacheKey(groupJid), { timestamp: Date.now(), data: meta });
       }
 
       return meta;
@@ -4445,9 +4460,10 @@ export class BaileysStartupService extends ChannelStartupService {
     const cacheConf = this.configService.get<CacheConf>('CACHE');
 
     if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
-      if (await groupMetadataCache?.has(groupJid)) {
-        console.log(`Cache request for group: ${groupJid}`);
-        const meta = await groupMetadataCache.get(groupJid);
+      const key = this.groupCacheKey(groupJid);
+      if (await groupMetadataCache?.has(key)) {
+        this.logger.verbose(`Cache request for group: ${groupJid}`);
+        const meta = await groupMetadataCache.get(key);
 
         if (Date.now() - meta.timestamp > 3600000) {
           await this.updateGroupMetadataCache(groupJid);
