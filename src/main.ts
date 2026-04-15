@@ -336,6 +336,7 @@ function registerShutdownHandlers({ server, prismaRepository, logger }: Shutdown
       await Promise.allSettled(
         Object.entries(waMonitor.waInstances ?? {}).map(async ([name, inst]) => {
           try {
+            inst?.stopAllCronTasks?.();
             inst?.client?.ws?.close?.();
             await inst?.client?.end?.(undefined);
           } catch (e) {

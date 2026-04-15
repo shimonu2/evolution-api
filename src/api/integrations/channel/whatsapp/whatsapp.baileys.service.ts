@@ -271,6 +271,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.stopAllCronTasks();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -4839,11 +4840,39 @@ export class BaileysStartupService extends ChannelStartupService {
     return messageRaw;
   }
 
+  // Track active cron jobs so logoutInstance() + graceful shutdown can stop
+  // them. Without this, a restarted instance left its old cron running in
+  // the background, firing syncLostMessages against a dead auth state every
+  // 30 min and spamming the logs. Keyed by cron "name" for clarity.
+  private cronTasks: Map<string, any> = new Map();
+
+  private stopCronTask(name: string) {
+    const task = this.cronTasks.get(name);
+    if (!task) return;
+    try {
+      task.stop();
+    } catch (e) {
+      this.logger.warn(`Failed to stop cron "${name}": ${(e as Error)?.message ?? e}`);
+    } finally {
+      this.cronTasks.delete(name);
+    }
+  }
+
+  public stopAllCronTasks() {
+    for (const name of Array.from(this.cronTasks.keys())) {
+      this.stopCronTask(name);
+    }
+  }
+
   private async syncChatwootLostMessages() {
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
       const chatwootConfig = await this.findChatwoot();
       const prepare = (message: any) => this.prepareMessage(message);
       this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
+
+      // Replace any previous task for this name (e.g., on reconnect) so we
+      // don't end up with two crons firing the same sync job in parallel.
+      this.stopCronTask('chatwoot:syncLostMessages');
 
       // Generate ID for this cron task and store in cache
       const cronId = cuid();
@@ -4857,12 +4886,13 @@ export class BaileysStartupService extends ChannelStartupService {
           const storedId = await cache.hGet(cronKey, this.instance.name);
           if (storedId && storedId !== cronId) {
             this.logger.info(`Stopping syncChatwootLostMessages cron - ID mismatch: ${cronId} vs ${storedId}`);
-            task.stop();
+            this.stopCronTask('chatwoot:syncLostMessages');
             return;
           }
         }
         this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
       });
+      this.cronTasks.set('chatwoot:syncLostMessages', task);
       task.start();
     }
   }
