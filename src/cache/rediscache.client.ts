@@ -7,9 +7,30 @@ class Redis {
   private client: RedisClientType = null;
   private conf: CacheConfRedis;
   private connected = false;
+  // Dedup reconnect / error spam: without a filter, a down Redis produces
+  // ~10 lines/sec at peak backoff rate and drowns real signal in logs.
+  private lastErrorMessage = '';
+  private lastErrorLoggedAt = 0;
 
   constructor() {
     this.conf = configService.get<CacheConf>('CACHE')?.REDIS;
+  }
+
+  // Log attempts 1, 5, 10, 15, 20 only — enough to see progress without
+  // flooding. Always log the first (so operators know) and the last (so
+  // they know we gave up).
+  private shouldLogRetry(retries: number): boolean {
+    return retries <= 1 || retries === 20 || retries % 5 === 0;
+  }
+
+  // Suppress duplicate error messages within a 30s window so a persistent
+  // "ECONNREFUSED" doesn't appear 300 times in 30s.
+  private logErrorDeduped(msg: string) {
+    const now = Date.now();
+    if (msg === this.lastErrorMessage && now - this.lastErrorLoggedAt < 30_000) return;
+    this.lastErrorMessage = msg;
+    this.lastErrorLoggedAt = now;
+    this.logger.error(`redis error: ${msg}`);
   }
 
   getConnection(): RedisClientType {
@@ -27,7 +48,9 @@ class Redis {
             return new Error('Redis max reconnect attempts exceeded');
           }
           const delay = Math.min(retries * 100, 3_000);
-          this.logger.warn(`redis reconnect attempt ${retries} in ${delay}ms`);
+          if (this.shouldLogRetry(retries)) {
+            this.logger.warn(`redis reconnect attempt ${retries} in ${delay}ms`);
+          }
           return delay;
         },
       },
@@ -38,12 +61,13 @@ class Redis {
     });
 
     this.client.on('ready', () => {
-      this.logger.verbose('redis ready');
+      this.logger.info('redis ready');
       this.connected = true;
+      this.lastErrorMessage = '';
     });
 
     this.client.on('error', (err) => {
-      this.logger.error(`redis error: ${err?.message || err}`);
+      this.logErrorDeduped(String(err?.message ?? err));
       this.connected = false;
     });
 
@@ -53,7 +77,7 @@ class Redis {
     });
 
     this.client.on('reconnecting', () => {
-      this.logger.verbose('redis reconnecting');
+      // suppressed: reconnectStrategy() already logs these with context
     });
 
     this.client.connect().catch((e) => {

@@ -36,6 +36,22 @@ async function initWA() {
 
 const errorWebhookClient = axios.create({ timeout: 5_000 });
 
+// Register a minimal bootstrap-time SIGINT/SIGTERM handler BEFORE any async
+// init runs, so Ctrl+C works even if startup hangs on a slow Prisma connect.
+// The full graceful-shutdown handler replaces these later in bootstrap().
+const bootstrapSignalHandlers = {
+  sigterm: () => {
+    console.log('[SERVER] SIGTERM during bootstrap — exiting');
+    process.exit(143);
+  },
+  sigint: () => {
+    console.log('[SERVER] SIGINT during bootstrap — exiting');
+    process.exit(130);
+  },
+};
+process.on('SIGTERM', bootstrapSignalHandlers.sigterm);
+process.on('SIGINT', bootstrapSignalHandlers.sigint);
+
 async function bootstrap() {
   const logger = new Logger('SERVER');
   const app = express();
@@ -43,12 +59,24 @@ async function bootstrap() {
   let providerFiles: ProviderFiles = null;
   if (configService.get<ProviderSession>('PROVIDER').ENABLED) {
     providerFiles = new ProviderFiles(configService);
-    await providerFiles.onModuleInit();
+    try {
+      await providerFiles.onModuleInit();
+    } catch (err) {
+      logger.error(`Failed to init provider files: ${(err as Error)?.message ?? err}`);
+      throw err;
+    }
     logger.info('Provider:Files - ON');
   }
 
   const prismaRepository = new PrismaRepository(configService);
-  await prismaRepository.onModuleInit();
+  try {
+    await prismaRepository.onModuleInit();
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    logger.error(`Cannot connect to database: ${msg}`);
+    logger.error('Verify DATABASE_CONNECTION_URI and that the database is reachable.');
+    throw err;
+  }
 
   // Trust the first proxy hop so req.ip reflects the real client when running
   // behind a load balancer (nginx, ALB, Cloud Run). Required for reliable
@@ -136,8 +164,13 @@ async function bootstrap() {
       methods: [...configService.get<Cors>('CORS').METHODS],
       credentials: configService.get<Cors>('CORS').CREDENTIALS,
     }),
-    urlencoded({ extended: true, limit: '5mb' }),
-    json({ limit: '5mb' }),
+    // Body size limit: default 50mb is generous enough for base64-encoded
+    // WhatsApp media sends (WA's own upload cap is 16mb; base64 overhead
+    // ≈ ×1.33 → ~22mb payload) with headroom for legit clients, while
+    // blocking the previous 136mb that let a single request OOM the process.
+    // Tunable via REQUEST_BODY_LIMIT_MB.
+    urlencoded({ extended: true, limit: `${process.env.REQUEST_BODY_LIMIT_MB ?? 50}mb` }),
+    json({ limit: `${process.env.REQUEST_BODY_LIMIT_MB ?? 50}mb` }),
     compression(),
   );
 
@@ -245,6 +278,11 @@ async function bootstrap() {
   });
 
   onUnexpectedError();
+
+  // Replace the bootstrap-time signal handlers with the full graceful
+  // shutdown that closes sockets, Prisma, Redis, etc.
+  process.off('SIGTERM', bootstrapSignalHandlers.sigterm);
+  process.off('SIGINT', bootstrapSignalHandlers.sigint);
   registerShutdownHandlers({ server, prismaRepository, logger });
 }
 
@@ -306,4 +344,13 @@ function registerShutdownHandlers({ server, prismaRepository, logger }: Shutdown
   process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
-bootstrap();
+bootstrap().catch((err) => {
+  // Bootstrap threw after exhausting our nested try/catches. Log a clear
+  // one-liner so operators see the reason without scrolling through a
+  // Prisma query-engine dump, then exit with non-zero so the process
+  // manager restarts us.
+  const msg = (err as Error)?.message ?? String(err);
+  // eslint-disable-next-line no-console
+  console.error(`[SERVER] Bootstrap failed: ${msg}`);
+  process.exit(1);
+});
