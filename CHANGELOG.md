@@ -1,3 +1,39 @@
+# 2.3.8-robustness.0414.4 (2026-04-15)
+
+### Close-the-gap fixes after live run
+
+Issues that only surfaced when I actually started the server against a real
+(broken) environment, plus the audit-flagged legacy code paths I hadn't
+touched in the first two rounds.
+
+**Live-run regressions closed**
+* L3: body limit 5mb → 50mb default (tunable via REQUEST_BODY_LIMIT_MB).
+  5mb was rejecting legitimate base64 `/send/media` payloads.
+* L2: bootstrap failures now print a one-line operator message instead of
+  a 4 kB Prisma internal stack dump. SIGTERM / SIGINT handlers register
+  BEFORE async init so Ctrl+C works during startup hangs.
+* L1: Redis reconnect logs throttled to attempts 1, 5, 10, 15, 20.
+  AggregateError is unwrapped so `redis error:` is never empty. Duplicate
+  error messages deduped within a 30s window.
+
+**Legacy paths hardened (out of scope of first two rounds)**
+* **WA Business channel** `post()` used to return `undefined` on any
+  error — messages were silently dropped. Now throws, with a 30s timeout.
+* **WA Business `downloadMediaMessage`**: 15s metadata timeout, 60s +
+  50 mb body cap on the actual download (was unbounded). Tunable via
+  `WA_MEDIA_MAX_BYTES`.
+* **Chatwoot Postgres pool** now properly disposed on graceful shutdown;
+  recreated on pool error instead of handing out a dead pool. Added pool
+  max, idle + connection timeouts.
+* **Chatwoot axios calls** got 30s timeouts (message POSTs) + size caps
+  (media prefetch 50 mb, ads thumbnail 10 mb).
+* **Baileys media inlining** for `webhookBase64` now checks `fileLength`
+  before download and skips files > `WA_MEDIA_MAX_BYTES`. Previously a
+  100 mb WA document allocated ~233 mb of RAM per inbound message.
+* **Baileys cache TTLs**: `msgRetryCounterCache` was never expiring
+  (accumulated forever); now 1 h stdTTL. `userDevicesCache` had a bogus
+  `300000` literal interpreted as seconds (= 3.5 days!); now 300 s.
+
 # 2.3.8-robustness.0414.3 (2026-04-15)
 
 ### Self-audit fixes
