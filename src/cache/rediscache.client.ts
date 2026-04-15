@@ -67,7 +67,15 @@ class Redis {
     });
 
     this.client.on('error', (err) => {
-      this.logErrorDeduped(String(err?.message ?? err));
+      // AggregateError (thrown by node's ESM connect) has no useful .message;
+      // pull the inner error[0] if available, otherwise fall back to .code
+      // or String(err) so we never log "redis error: <empty>".
+      let msg = err?.message;
+      if (!msg && err?.errors?.length) {
+        msg = err.errors[0]?.message ?? err.errors[0]?.code ?? String(err.errors[0]);
+      }
+      if (!msg) msg = err?.code ?? String(err);
+      this.logErrorDeduped(msg);
       this.connected = false;
     });
 
