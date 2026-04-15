@@ -44,14 +44,16 @@ export class NatsController extends EventController implements EventControllerIn
         }
       })().catch((err) => this.logger.error(`NATS status stream error: ${(err as Error)?.message ?? err}`));
 
-      // Surface permanent connection close.
-      this.natsClient
-        .closed()
-        .then((err) => {
+      // Surface permanent connection close. Use a single then(onFulfilled,
+      // onRejected) so the rejection handler is attached synchronously and
+      // there is no microtask window where a rejection could go unhandled.
+      this.natsClient.closed().then(
+        (err) => {
           if (err) this.logger.error(`NATS connection closed with error: ${err?.message ?? err}`);
           else this.logger.warn('NATS connection closed');
-        })
-        .catch((err) => this.logger.error(`NATS closed() rejected: ${(err as Error)?.message ?? err}`));
+        },
+        (err) => this.logger.error(`NATS closed() rejected: ${(err as Error)?.message ?? err}`),
+      );
 
       if (configService.get<Nats>('NATS')?.GLOBAL_ENABLED) {
         await this.initGlobalSubscriptions();

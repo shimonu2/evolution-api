@@ -443,6 +443,11 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      // Reset the pairing clock — otherwise a failed pairing attempt (socket
+      // closed before the user scanned) leaves a stale pairingStartedAt, and
+      // the next attempt's first QR would instantly blow the budget.
+      this.pairingStartedAt = null;
+
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
@@ -1895,11 +1900,19 @@ export class BaileysStartupService extends ChannelStartupService {
   // Conservative retry: only retry on transport errors that clearly indicate
   // the message did NOT reach the server (ECONNRESET, WebSocket closed).
   // Never retry blind — duplicate sends are a worse bug than a lost one.
+  //
+  // Total wall-clock cap of ~6s (5s first ensure + 500ms backoff + ~500ms
+  // second ensure) so a single send can't park a request for >10s under a
+  // flapping connection.
   private async sendWithRetry<T>(op: () => Promise<T>, label: string, maxAttempts = 2): Promise<T> {
     let lastErr: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        await this.ensureConnected();
+        // Give the first attempt a generous 5s window; subsequent attempts
+        // assume we just waited and the socket should be ready or not
+        // imminently — cap at 500ms so two retries never stack to 10s.
+        const connectBudget = attempt === 1 ? 5_000 : 500;
+        await this.ensureConnected(connectBudget);
         return await op();
       } catch (err) {
         lastErr = err;
@@ -1924,13 +1937,20 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private saveCredsSerialized(): Promise<void> {
-    // Append to the chain; swallow rejections so one failing write doesn't
-    // poison subsequent ones. Actual errors are logged inside runSafe.
-    this.saveCredsChain = this.saveCredsChain.then(
-      () => this.instance.authState?.saveCreds?.() ?? Promise.resolve(),
-      () => this.instance.authState?.saveCreds?.() ?? Promise.resolve(),
-    );
-    return this.saveCredsChain;
+    // Sequentialize writes, but keep the *internal* chain always-resolved so
+    // one failed saveCreds() can't leave the chain in a rejected state that
+    // quietly skips every subsequent attempt via an onRejected branch.
+    //
+    // - `next` preserves the rejection so the caller can await it and log.
+    // - `saveCredsChain` is the same promise with a .catch(), so it is
+    //   always resolved by the time the next call chains off it.
+    const next = this.saveCredsChain.then(async () => {
+      await this.instance.authState?.saveCreds?.();
+    });
+    this.saveCredsChain = next.catch((err) => {
+      this.logger.error(`saveCreds failed: ${(err as Error)?.message ?? err}`);
+    });
+    return next;
   }
 
   private eventHandler() {

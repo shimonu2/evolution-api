@@ -14,9 +14,22 @@ export const metricsEnabled = process.env.METRICS !== 'false';
 
 export const registry = new Registry();
 
-if (metricsEnabled) {
-  collectDefaultMetrics({ register: registry });
-  logger.info('Metrics - ON (GET /metrics)');
+// Guard against double-registration. prom-client throws
+// "Error: A metric with the name X has already been registered" if
+// collectDefaultMetrics() or a Counter/Gauge constructor runs twice against
+// the same registry. That happens in hot-reload (tsx watch), jest module
+// resets, or any test that re-imports this module. A single try/catch keeps
+// the error from taking the process down on reload.
+let defaultsRegistered = false;
+
+if (metricsEnabled && !defaultsRegistered) {
+  try {
+    collectDefaultMetrics({ register: registry });
+    defaultsRegistered = true;
+    logger.info('Metrics - ON (GET /metrics)');
+  } catch (err) {
+    logger.warn(`Metrics default collector already registered: ${(err as Error)?.message ?? err}`);
+  }
 }
 
 // ----- Custom metrics -----
