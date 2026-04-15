@@ -245,8 +245,15 @@ export class BaileysStartupService extends ChannelStartupService {
   // creds.update events arriving back-to-back (common during multidevice
   // sync) cannot interleave their writes and corrupt the auth state.
   private saveCredsChain: Promise<void> = Promise.resolve();
-  private readonly msgRetryCounterCache: CacheStore = new NodeCache();
-  private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
+  // Both caches are per-instance. TTLs cap long-run memory growth — a
+  // long-lived instance otherwise accumulates retry counters and device
+  // records for every remote JID it ever interacted with.
+  // msgRetryCounterCache: 1h is enough for Baileys' protocol-level retry logic;
+  // entries that haven't been touched in an hour are stale.
+  // userDevicesCache: 5min TTL stays aligned with Baileys' recommended value;
+  // useClones:false keeps raw references to avoid cloning large device lists.
+  private readonly msgRetryCounterCache: CacheStore = new NodeCache({ stdTTL: 3_600, checkperiod: 600 });
+  private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
@@ -1452,18 +1459,27 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (this.localWebhook.enabled) {
             if (isMedia && this.localWebhook.webhookBase64) {
-              try {
-                const buffer = await downloadMediaMessage(
-                  { key: received.key, message: received?.message },
-                  'buffer',
-                  {},
-                  { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
-                );
+              // Skip base64 inlining for media above WA_MEDIA_MAX_BYTES
+              // (default 50mb). A 100mb WA document otherwise allocates
+              // 100mb of buffer + ~133mb of base64 in memory on every
+              // inbound message — 10 concurrent messages = 2gb peak, OOM
+              // on any container smaller than 4gb.
+              const maxBytes = Number(process.env.WA_MEDIA_MAX_BYTES ?? 50 * 1024 * 1024);
+              const anyMsg: any = received?.message ?? {};
+              const mediaNode =
+                anyMsg.imageMessage ||
+                anyMsg.videoMessage ||
+                anyMsg.audioMessage ||
+                anyMsg.documentMessage ||
+                anyMsg.stickerMessage;
+              const fileLength = Number(mediaNode?.fileLength ?? 0);
 
-                if (buffer) {
-                  messageRaw.message.base64 = buffer.toString('base64');
-                } else {
-                  // retry to download media
+              if (fileLength > 0 && fileLength > maxBytes) {
+                this.logger.warn(
+                  `Skipping base64 inline for ${received.key?.id}: fileLength ${fileLength} > ${maxBytes}`,
+                );
+              } else {
+                try {
                   const buffer = await downloadMediaMessage(
                     { key: received.key, message: received?.message },
                     'buffer',
@@ -1471,12 +1487,28 @@ export class BaileysStartupService extends ChannelStartupService {
                     { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
                   );
 
-                  if (buffer) {
+                  if (buffer && buffer.length <= maxBytes) {
                     messageRaw.message.base64 = buffer.toString('base64');
+                  } else if (buffer && buffer.length > maxBytes) {
+                    this.logger.warn(
+                      `Downloaded media for ${received.key?.id} is ${buffer.length}B > ${maxBytes}B — not inlining`,
+                    );
+                  } else {
+                    // retry to download media
+                    const retry = await downloadMediaMessage(
+                      { key: received.key, message: received?.message },
+                      'buffer',
+                      {},
+                      { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+                    );
+
+                    if (retry && retry.length <= maxBytes) {
+                      messageRaw.message.base64 = retry.toString('base64');
+                    }
                   }
+                } catch (error) {
+                  this.logger.error(['Error converting media to base64', error?.message]);
                 }
-              } catch (error) {
-                this.logger.error(['Error converting media to base64', error?.message]);
               }
             }
           }
