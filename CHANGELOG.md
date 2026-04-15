@@ -1,3 +1,42 @@
+# 2.3.8-robustness.0414.5 (2026-04-15)
+
+### Caller-blocking + DoS surfaces closed
+
+Cleared the remaining items from the "what's left on the table" list.
+
+* **event manager** runs all 7 transports in parallel via Promise.allSettled
+  instead of awaiting them one at a time. Previously a slow webhook (with
+  retries up to ~25 min) blocked every later transport AND the caller
+  (channel.service awaits emit() on every received message).
+* **webhook retries are now fire-and-forget** from emit()'s perspective.
+  retryWebhookRequest still logs each attempt, just doesn't park the
+  request handler waiting on it.
+* **WebSocket connection caps**: WEBSOCKET_MAX_CONNECTIONS (default 5000)
+  and WEBSOCKET_MAX_CONNECTIONS_PER_IP (default 50). Closes a memory-DoS
+  surface where a single IP could open thousands of Socket.io clients.
+* **trust proxy is conditional** via TRUST_PROXY_HOPS (default 1). Set to
+  0 if not behind a reverse proxy, otherwise X-Forwarded-For spoofing
+  bypasses the rate limiter. Startup logs the chosen value.
+* **Cron jobs are tracked + cleaned** on logoutInstance and graceful
+  shutdown. The Chatwoot syncLostMessages cron used to keep firing every
+  30 min after logout, spamming errors against a dead auth state.
+* **ensureConnected opt-out** via ENSURE_CONNECTED_ON_SEND=false for
+  operators who relied on the pre-0414 silent-queue behavior. Default
+  stays "fail fast".
+* **groupMetadataCache keys are scoped per instance**. Multiple Baileys
+  instances can be members of the same WA group; without scoping, they
+  overwrote each other's cached metadata.
+
+### Live-run validation
+
+This version was actually started against a no-Redis / no-Postgres env to
+verify the L1/L2 fixes from 0414.4 work as intended:
+- Redis logs throttled to attempts 0/1 only (3 clients × 6 lines instead
+  of 3 × 60), `redis error:` now contains the actual ECONNREFUSED message.
+- Bootstrap failure produces a one-line operator message ("Cannot connect
+  to database: ...") and exits cleanly instead of dumping the Prisma
+  query-engine stack.
+
 # 2.3.8-robustness.0414.4 (2026-04-15)
 
 ### Close-the-gap fixes after live run
