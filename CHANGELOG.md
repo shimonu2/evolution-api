@@ -1,3 +1,29 @@
+# 2.3.8-robustness.0414.3 (2026-04-15)
+
+### Self-audit fixes
+
+Follow-up to 0414.2 addressing 7 real bugs surfaced by a code review of the
+new robustness code itself.
+
+* **baileys**: `pairingStartedAt` now resets on `connection=close` so a
+  failed pairing attempt doesn't instantly trip the budget check on retry.
+* **baileys**: `saveCredsChain` internal reference is now always-resolved
+  (via a `.catch` mapping) so one failed `saveCreds` can't leave the chain
+  in a rejected state that short-circuits subsequent writes.
+* **baileys**: `sendWithRetry` uses a 500ms `ensureConnected` window on
+  retry attempts (down from 5s), capping total wall-clock at ~6.5s so a
+  single send can no longer park an HTTP request for ~11.5s.
+* **metrics**: `collectDefaultMetrics` wrapped in a guard flag + try/catch
+  so tsx-watch reloads and jest module resets can't crash the process with
+  "Duplicated metrics in registry".
+* **nats**: `closed()` now uses a single `.then(onFulfilled, onRejected)`
+  so the rejection handler is attached synchronously (no microtask gap).
+* **monitor**: zombie detector tracks in-flight reloads in a `Set<string>`
+  so it can't fire a second `reloadConnection()` while a previous one is
+  still racing with a Baileys-driven reconnect.
+* **logger**: `safeLog` now strips ANSI escape codes before the stderr
+  fallback write so emergency output is readable in log aggregators.
+
 # 2.3.8-robustness.0414.2 (2026-04-14)
 
 ### Robustness Hardening — Part 2
