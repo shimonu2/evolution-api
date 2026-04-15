@@ -1107,6 +1107,7 @@ export class ChatwootService {
         ...data.getHeaders(),
       },
       data: data,
+      timeout: 30_000,
     };
 
     try {
@@ -1180,6 +1181,7 @@ export class ChatwootService {
         ...data.getHeaders(),
       },
       data: data,
+      timeout: 30_000,
     };
 
     try {
@@ -1203,6 +1205,8 @@ export class ChatwootService {
 
         const response = await axios.get(media, {
           responseType: 'arraybuffer',
+          timeout: 30_000,
+          maxContentLength: 50 * 1024 * 1024,
         });
         mimeType = response.headers['content-type'];
       }
@@ -2212,7 +2216,11 @@ export class ChatwootService {
 
         const isAdsMessage = (adsMessage && adsMessage.title) || adsMessage.body || adsMessage.thumbnailUrl;
         if (isAdsMessage) {
-          const imgBuffer = await axios.get(adsMessage.thumbnailUrl, { responseType: 'arraybuffer' });
+          const imgBuffer = await axios.get(adsMessage.thumbnailUrl, {
+            responseType: 'arraybuffer',
+            timeout: 15_000,
+            maxContentLength: 10 * 1024 * 1024,
+          });
 
           const extension = mimeTypes.extension(imgBuffer.headers['content-type']);
           const mimeType = extension && mimeTypes.lookup(extension);

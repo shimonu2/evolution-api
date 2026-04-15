@@ -1,6 +1,7 @@
 // Import this first from sentry instrument!
 import '@utils/instrumentSentry';
 
+import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 // Now import other modules
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
@@ -332,6 +333,7 @@ function registerShutdownHandlers({ server, prismaRepository, logger }: Shutdown
 
       await prismaRepository.onModuleDestroy();
       await redisClient.disconnect();
+      await postgresClient.disconnect();
       logger.info('Shutdown complete.');
       process.exit(0);
     } catch (e) {
