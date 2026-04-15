@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Evolution API · Robust-0414 · One-Pager</title>
+<style>
+  @page { size: A4; margin: 14mm 14mm 12mm 14mm; }
+  * { box-sizing: border-box; }
+  html, body {
+    font-family: -apple-system, "SF Pro Text", Helvetica, Arial, sans-serif;
+    color: #1a1a1a;
+    font-size: 9.5pt;
+    line-height: 1.35;
+    margin: 0;
+  }
+  h1 { font-size: 18pt; margin: 0 0 2px; letter-spacing: -0.2px; }
+  h2 { font-size: 11pt; margin: 10px 0 4px; padding-bottom: 2px; border-bottom: 1px solid #d0d0d0; color: #1f3a5f; }
+  .sub { color: #555; font-size: 9pt; margin: 0 0 6px; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 8pt; font-family: "SF Mono", Menlo, monospace; }
+  .badge-blue { background: #e8f0fb; color: #1f3a5f; }
+  .badge-amber { background: #fff4d6; color: #7a5500; }
+  .badge-green { background: #e3f5e8; color: #1f5c2f; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px 16px; }
+  table { width: 100%; border-collapse: collapse; font-size: 8.5pt; margin: 4px 0; }
+  th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid #ececec; vertical-align: top; }
+  th { background: #f6f8fb; color: #1f3a5f; font-weight: 600; font-size: 8pt; text-transform: uppercase; letter-spacing: 0.3px; }
+  td.code, .code { font-family: "SF Mono", Menlo, monospace; font-size: 8.5pt; }
+  ul { margin: 4px 0 6px 16px; padding: 0; }
+  li { margin: 1px 0; }
+  .footer { border-top: 1px solid #d0d0d0; padding-top: 6px; margin-top: 10px; font-size: 8pt; color: #555; display: flex; justify-content: space-between; }
+  .accent { color: #1f3a5f; font-weight: 600; }
+  .warn { color: #7a5500; font-weight: 600; }
+</style>
+</head>
+<body>
+
+<h1>Evolution API · <span class="accent">Robust-0414</span></h1>
+<p class="sub">
+  Production-hardening fork of <span class="code">EvolutionAPI/evolution-api</span> · version
+  <span class="code">2.3.8-robustness.0414.5</span> · 42 commits across 30+ files ·
+  <span class="badge badge-blue">multi-arch: linux/amd64, linux/arm64</span>
+</p>
+
+<div class="grid-2">
+  <div>
+    <h2>🐳 Docker Hub · <span class="code">shimonuziel/evolution-api</span></h2>
+    <table>
+      <tr><th>Tag</th><th>Use</th></tr>
+      <tr><td class="code">robust-0414.5</td><td><b>Production</b> — pinned, immutable</td></tr>
+      <tr><td class="code">0414.5</td><td>Same image, short alias</td></tr>
+      <tr><td class="code">v2.3.8-robustness.0414.5</td><td>Same image, matches git tag</td></tr>
+      <tr><td class="code">robust</td><td>Rolling — dev only, NOT prod compose</td></tr>
+    </table>
+    <p class="code" style="font-size:7.5pt; color:#666; margin-top:2px;">
+      digest: sha256:a08125ffe95f39ffd77c757a644474b046f845589785700ffead6cc7a87f328a
+    </p>
+  </div>
+
+  <div>
+    <h2>📚 Docs (read in order)</h2>
+    <table>
+      <tr><th>File</th><th>Audience</th></tr>
+      <tr><td class="code">SUMMARY.md</td><td>Master index — start here</td></tr>
+      <tr><td class="code">DEPLOY.md</td><td>Operator runbook (compose, env, verify)</td></tr>
+      <tr><td class="code">ROBUSTNESS.md</td><td>23 env vars + tuning playbook</td></tr>
+      <tr><td class="code">CHANGELOG.md</td><td>Per-release log (5 releases)</td></tr>
+      <tr><td class="code">.env.example</td><td>Updated template w/ new vars</td></tr>
+    </table>
+  </div>
+</div>
+
+<h2>What changed (compared to <span class="code">evoapicloud/evolution-api:latest</span>)</h2>
+<div class="grid-3">
+  <div>
+    <b class="accent">Lifecycle &amp; HTTP</b>
+    <ul>
+      <li>Graceful SIGTERM / SIGINT shutdown (25s budget, closes HTTP → Baileys → Prisma → Redis → Chatwoot pg)</li>
+      <li>HTTP server timeouts (keepAlive, headers, request, maxConnections)</li>
+      <li>helmet + express-rate-limit (600/min/IP, tunable)</li>
+      <li>Conditional <span class="code">trust proxy</span> (anti-spoof)</li>
+      <li>Bootstrap failures exit cleanly (no Prisma stack dump)</li>
+      <li>uncaughtException → Sentry + exit(1)</li>
+      <li>New endpoints: <span class="code">/health/live</span>, <span class="code">/health/ready</span>, <span class="code">/metrics</span></li>
+    </ul>
+  </div>
+  <div>
+    <b class="accent">Baileys / WhatsApp</b>
+    <ul>
+      <li>Removed double-reconnect race (zombie instance bug)</li>
+      <li>Per-event try/catch in event handler</li>
+      <li>Pre-send connection guard + bounded retry on transport errors</li>
+      <li>saveCreds() per-instance mutex</li>
+      <li>Per-instance groupMetadataCache scoping</li>
+      <li>Status broadcast throttling</li>
+      <li>Absolute QR pairing budget (5 min)</li>
+      <li>Media inlining size cap (50 MB)</li>
+      <li>msgRetryCounterCache TTL (was unbounded)</li>
+      <li>Cron jobs tracked + stopped on logout</li>
+      <li>Zombie-instance detector with reload race guard</li>
+    </ul>
+  </div>
+  <div>
+    <b class="accent">Integrations &amp; ops</b>
+    <ul>
+      <li>30s timeouts on every chatbot HTTP call (OpenAI, Dify, Flowise, N8N, Typebot, EvoAI, EvolutionBot)</li>
+      <li>Per-endpoint circuit breakers (opossum)</li>
+      <li>OpenAI Assistant runs bounded by wall-clock</li>
+      <li>WA Business <span class="code">post()</span> throws on failure (was silent)</li>
+      <li>Chatwoot pg pool disposed on shutdown</li>
+      <li>Event manager runs all 7 transports concurrently</li>
+      <li>Webhook retries fire-and-forget</li>
+      <li>WebSocket connection caps (global + per-IP)</li>
+      <li>Prisma pool, connect, statement timeouts</li>
+      <li>Redis reconnect strategy + log throttle</li>
+      <li>Prometheus <span class="code">/metrics</span> endpoint</li>
+      <li>npm audit: <b>66 → 5</b> findings (dev-only)</li>
+    </ul>
+  </div>
+</div>
+
+<div class="grid-2">
+  <div>
+    <h2>⚠️ Behavior changes worth knowing</h2>
+    <ul>
+      <li><b>Body limit 50 MB</b> (was 136 MB) — tunable via <span class="code">REQUEST_BODY_LIMIT_MB</span></li>
+      <li><b>Sends to disconnected instances throw 400</b> (used to silently queue) — opt out with <span class="code">ENSURE_CONNECTED_ON_SEND=false</span></li>
+      <li><b>WA Business sends throw on failure</b> (used to return undefined)</li>
+      <li><b>SIGTERM = graceful shutdown</b> (~25s) — set <span class="code">stop_grace_period: 30s</span> in compose</li>
+      <li><b>uncaughtException exits the process</b> by default — disable with <span class="code">EXIT_ON_UNCAUGHT=false</span></li>
+    </ul>
+  </div>
+  <div>
+    <h2>🚦 Smoke-test before merge</h2>
+    <ul>
+      <li>Compose stack up with real Postgres + Redis</li>
+      <li><span class="code">/health/live</span> 200 · <span class="code">/health/ready</span> 200 · <span class="code">/metrics</span> 200</li>
+      <li>Pair a WhatsApp instance via QR; send / receive text + media</li>
+      <li>Force Redis kill mid-flight → logs throttle, no crash</li>
+      <li>Force Postgres kill mid-flight → <span class="code">/health/ready</span> → 503</li>
+      <li><span class="code">kill -TERM $pid</span> → graceful shutdown sequence within 25 s</li>
+      <li>Open 51 WS connections from 1 IP → 51st rejected</li>
+    </ul>
+  </div>
+</div>
+
+<div class="grid-2">
+  <div>
+    <h2>❌ Honest gaps</h2>
+    <ul>
+      <li>Zero unit tests — all guards are reasoned-about-correctness only</li>
+      <li>Never paired a real WA instance during this build</li>
+      <li>No load test; no live SIGTERM test against connected instances</li>
+      <li>Custom Prometheus counters declared but increment hooks not yet wired</li>
+      <li>Session-store concurrency outside saveCreds mutex not audited</li>
+    </ul>
+  </div>
+  <div>
+    <h2>🚀 Quickstart</h2>
+    <table>
+      <tr><th>Step</th><th>Command</th></tr>
+      <tr><td>1. Pull image</td><td class="code">docker pull shimonuziel/evolution-api:robust-0414.5</td></tr>
+      <tr><td>2. Edit compose</td><td>image: <span class="code">shimonuziel/evolution-api:robust-0414.5</span><br>stop_grace_period: 30s</td></tr>
+      <tr><td>3. Bring up</td><td class="code">docker compose up -d</td></tr>
+      <tr><td>4. Verify</td><td class="code">curl -sf localhost:8080/health/live</td></tr>
+    </table>
+    <p style="margin-top:4px; font-size:8.5pt;">
+      Full step-by-step in <span class="code">DEPLOY.md</span>. Don't use <span class="code">:robust</span> or <span class="code">:latest</span> in production compose — those tags float.
+    </p>
+  </div>
+</div>
+
+<div class="footer">
+  <span>github.com/shimonu2/evolution-api · branch <span class="code">feat/robustness-0414</span> · PR #1</span>
+  <span>v2.3.8-robustness.0414.5 · April 2026</span>
+</div>
+
+</body>
+</html>
