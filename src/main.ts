@@ -79,10 +79,24 @@ async function bootstrap() {
     throw err;
   }
 
-  // Trust the first proxy hop so req.ip reflects the real client when running
-  // behind a load balancer (nginx, ALB, Cloud Run). Required for reliable
-  // rate-limit keying and accurate logging.
-  app.set('trust proxy', 1);
+  // Trust N proxy hops so req.ip reflects the real client behind a load
+  // balancer. 1 is the right value when exactly one reverse proxy (nginx,
+  // ALB, Cloud Run, Cloudflare's final hop) sits in front.
+  //
+  // WARNING: if TRUST_PROXY_HOPS > 0 and the service is NOT actually behind
+  // a proxy, clients can spoof their IP via X-Forwarded-For and bypass the
+  // rate limiter. Set TRUST_PROXY_HOPS=0 for bare-metal / on-prem where
+  // there is no proxy in front.
+  const trustProxyHops = Number(process.env.TRUST_PROXY_HOPS ?? 1);
+  if (trustProxyHops > 0) {
+    app.set('trust proxy', trustProxyHops);
+    logger.info(
+      `trust proxy = ${trustProxyHops} — set TRUST_PROXY_HOPS=0 if this service is NOT behind a reverse proxy (prevents X-Forwarded-For spoofing).`,
+    );
+  } else {
+    app.set('trust proxy', false);
+    logger.info('trust proxy = false — req.ip will use the direct socket peer');
+  }
 
   // /health must be reachable without auth so K8s/LB probes don't get blocked
   // by rate limiting or apikey middleware. Keep it cheap — a DB ping gates
