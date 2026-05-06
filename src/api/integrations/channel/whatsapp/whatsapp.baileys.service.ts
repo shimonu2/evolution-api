@@ -1517,10 +1517,18 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
-          if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
-            messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
+          if (messageRaw.key.remoteJid?.includes('@lid')) {
+            if (messageRaw.key.remoteJidAlt) {
+              this.logger.info(
+                `LID addressing: normalizing remoteJid ${messageRaw.key.remoteJid} → ${messageRaw.key.remoteJidAlt}`,
+              );
+              messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
+            } else {
+              this.logger.warn(
+                `LID addressing: remoteJid=${messageRaw.key.remoteJid} has no remoteJidAlt — webhook will contain raw LID JID`,
+              );
+            }
           }
-          console.log(messageRaw);
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 

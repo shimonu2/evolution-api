@@ -1,3 +1,16 @@
+# 2.3.8-robustness.0414.6 (2026-05-06)
+
+### LID addressing webhook fix
+
+* **LID → phone JID normalization hardened**: the `console.log(messageRaw)`
+  debug artifact left in the `messages.upsert` handler is removed.
+  The normalization block is now guarded by explicit if/else branches:
+  - when `remoteJidAlt` is present, logs `logger.info` with both JIDs for
+    observability, then replaces `remoteJid` before webhook dispatch.
+  - when `remoteJidAlt` is missing (edge case), logs `logger.warn` so
+    operators can spot LID messages that will still carry a raw `@lid` JID
+    downstream instead of silently passing through.
+
 # 2.3.8-robustness.0414.5 (2026-04-15)
 
 ### Caller-blocking + DoS surfaces closed
