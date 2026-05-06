@@ -1,3 +1,13 @@
+# 2.3.8-robustness.0414.9 (2026-05-06)
+
+### LID contacts.update deduplication fix
+
+* **Root cause**: Baileys fires `contacts.update` independently of `messages.upsert`.
+  That handler used `contact.id` raw, so every @lid event created a duplicate
+  contact row under the @lid JID even after the messages.upsert normalization fix.
+* **Fix**: skip any `contact.id` containing `@lid` in the `contacts.update` handler.
+  The canonical record under `@s.whatsapp.net` is maintained by messages.upsert.
+
 # 2.3.8-robustness.0414.8 (2026-05-06)
 
 ### LID contact lookup + contactRaw normalization fix

@@ -914,6 +914,9 @@ export class BaileysStartupService extends ChannelStartupService {
     'contacts.update': async (contacts: Partial<Contact>[]) => {
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
       for await (const contact of contacts) {
+        // Skip @lid contacts — canonical record lives under @s.whatsapp.net,
+        // maintained by messages.upsert with normalizedRemoteJid.
+        if (contact.id?.includes('@lid')) continue;
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
         contactsRaw.push({
           remoteJid: contact.id,
