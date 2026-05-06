@@ -1,3 +1,16 @@
+# 2.3.8-robustness.0414.8 (2026-05-06)
+
+### LID contact lookup + contactRaw normalization fix
+
+* **Root cause**: contact DB lookup and `contactRaw.remoteJid` still used
+  `received.key.remoteJid` (raw `@lid` JID) instead of `normalizedRemoteJid`.
+  For contacts stored under `@s.whatsapp.net`, the lookup returned null —
+  `CONTACTS_UPDATE` webhook was skipped and duplicate contact rows were
+  created (one under `@lid`, one under `@s.whatsapp.net`).
+* **Fix**: `findFirst`, `contactRaw.remoteJid`, and `profilePicture()` call
+  all now use `normalizedRemoteJid` so contact upsert and webhook dispatch
+  are consistent with the rest of the `@lid` normalization path.
+
 # 2.3.8-robustness.0414.7 (2026-05-06)
 
 ### LID webhook dispatch fix (immutable key)
