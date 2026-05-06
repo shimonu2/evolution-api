@@ -1,3 +1,18 @@
+# 2.3.8-robustness.0414.7 (2026-05-06)
+
+### LID webhook dispatch fix (immutable key)
+
+* **Root cause**: the in-place mutation `messageRaw.key.remoteJid = remoteJidAlt`
+  throws a TypeError when Baileys returns a protobuf-derived key with a
+  read-only `remoteJid` property. The outer try-catch swallows the error,
+  silently skipping the `sendDataWebhook` call — webhook never fires.
+* **Fix**: compute `normalizedRemoteJid` from `remoteJidAlt`, then spread
+  a new plain-JS key object `{ ...messageRaw.key, remoteJid: normalizedRemoteJid }`
+  so the property is always writable. No mutation of the original key.
+* `dispatchPayload` carries the normalized key to both `sendDataWebhook`
+  and `chatbotController.emit`; `messageRaw` (with the original `@lid` key)
+  is preserved in the DB record for audit.
+
 # 2.3.8-robustness.0414.6 (2026-05-06)
 
 ### LID addressing webhook fix

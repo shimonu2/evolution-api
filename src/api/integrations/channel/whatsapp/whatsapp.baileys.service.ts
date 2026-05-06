@@ -1517,25 +1517,35 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
-          if (messageRaw.key.remoteJid?.includes('@lid')) {
-            if (messageRaw.key.remoteJidAlt) {
-              this.logger.info(
-                `LID addressing: normalizing remoteJid ${messageRaw.key.remoteJid} → ${messageRaw.key.remoteJidAlt}`,
-              );
-              messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
-            } else {
-              this.logger.warn(
-                `LID addressing: remoteJid=${messageRaw.key.remoteJid} has no remoteJidAlt — webhook will contain raw LID JID`,
-              );
-            }
+          // Normalize LID JID without mutating the original key object.
+          // Protobuf-derived keys can have a read-only remoteJid property;
+          // an in-place assignment throws a TypeError that the outer
+          // try-catch swallows, silently skipping the webhook dispatch.
+          // Spreading creates a new plain-JS object where remoteJid is writable.
+          const normalizedRemoteJid =
+            messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt
+              ? messageRaw.key.remoteJidAlt
+              : messageRaw.key.remoteJid;
+          if (normalizedRemoteJid !== messageRaw.key.remoteJid) {
+            this.logger.info(
+              `LID addressing: normalizing remoteJid ${messageRaw.key.remoteJid} → ${normalizedRemoteJid}`,
+            );
+          } else if (messageRaw.key.remoteJid?.includes('@lid')) {
+            this.logger.warn(
+              `LID addressing: remoteJid=${messageRaw.key.remoteJid} has no remoteJidAlt — webhook will contain raw LID JID`,
+            );
           }
+          const dispatchPayload =
+            normalizedRemoteJid !== messageRaw.key.remoteJid
+              ? { ...messageRaw, key: { ...messageRaw.key, remoteJid: normalizedRemoteJid } }
+              : messageRaw;
 
-          this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+          this.sendDataWebhook(Events.MESSAGES_UPSERT, dispatchPayload);
 
           await chatbotController.emit({
             instance: { instanceName: this.instance.name, instanceId: this.instanceId },
-            remoteJid: messageRaw.key.remoteJid,
-            msg: messageRaw,
+            remoteJid: normalizedRemoteJid,
+            msg: dispatchPayload,
             pushName: messageRaw.pushName,
           });
 
