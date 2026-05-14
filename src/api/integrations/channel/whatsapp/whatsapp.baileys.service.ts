@@ -3999,6 +3999,21 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
+    // Configurable download timeout; default 30 s. Prevents indefinite hangs when
+    // the WhatsApp session is down or the CDN is unresponsive.
+    const timeoutMs = parseInt(process.env.MEDIA_DOWNLOAD_TIMEOUT_MS ?? '30000', 10);
+    const raceTimeout = <T>(p: Promise<T>): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout>;
+      const timeout = new Promise<never>((_, rej) => {
+        timer = setTimeout(
+          () =>
+            rej(Object.assign(new Error(`Media download timed out after ${timeoutMs / 1000}s`), { code: 'ETIMEOUT' })),
+          timeoutMs,
+        );
+      });
+      return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+    };
+
     try {
       const m = data?.message;
       const convertToMp4 = data?.convertToMp4 ?? false;
@@ -4057,42 +4072,83 @@ export class BaileysStartupService extends ChannelStartupService {
         msg.message[mediaType].mediaKey = Uint8Array.from(Object.values(mediaMessage['mediaKey']));
       }
 
+      // Determine session state before choosing a download path.
+      // When disconnected, reuploadRequest (which requires an active WebSocket) must be
+      // skipped — calling it on a dead socket hangs indefinitely with no response.
+      // downloadContentFromMessage uses plain HTTPS and works without an active session
+      // as long as the CDN URL has not expired.
+      const isConnected = this.stateConnection?.state === 'open' && !!this.client?.user;
+
+      const cdnDownload = async (): Promise<Buffer> => {
+        const resolvedType = Object.keys(msg.message).find((k) => k.endsWith('Message'));
+        if (!resolvedType) throw new Error('Could not determine mediaType for CDN download');
+        const media = await downloadContentFromMessage(
+          {
+            mediaKey: msg.message?.[resolvedType]?.mediaKey,
+            directPath: msg.message?.[resolvedType]?.directPath,
+            url: `https://mmg.whatsapp.net${msg?.message?.[resolvedType]?.directPath}`,
+          },
+          await this.mapMediaType(resolvedType),
+          {},
+        );
+        const chunks: Buffer[] = [];
+        for await (const chunk of media) {
+          chunks.push(chunk);
+        }
+        return Buffer.concat(chunks);
+      };
+
       let buffer: Buffer;
 
-      try {
-        buffer = await downloadMediaMessage(
-          { key: msg?.key, message: msg?.message },
-          'buffer',
-          {},
-          { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+      if (!isConnected) {
+        // Session is down — skip reuploadRequest to avoid hanging on a dead socket.
+        this.logger.warn(
+          `Instance "${this.instance.name}" is not connected (state=${this.stateConnection?.state ?? 'unknown'}) — attempting direct CDN download`,
         );
-      } catch {
-        this.logger.error('Download Media failed, trying to retry in 5 seconds...');
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-        const mediaType = Object.keys(msg.message).find((key) => key.endsWith('Message'));
-        if (!mediaType) throw new Error('Could not determine mediaType for fallback');
-
         try {
-          const media = await downloadContentFromMessage(
-            {
-              mediaKey: msg.message?.[mediaType]?.mediaKey,
-              directPath: msg.message?.[mediaType]?.directPath,
-              url: `https://mmg.whatsapp.net${msg?.message?.[mediaType]?.directPath}`,
-            },
-            await this.mapMediaType(mediaType),
-            {},
+          buffer = await raceTimeout(cdnDownload());
+          this.logger.info('Direct CDN download succeeded despite disconnected session.');
+        } catch (cdnErr) {
+          const isTimeout = (cdnErr as Error)?.['code'] === 'ETIMEOUT';
+          throw new BadRequestException(
+            isTimeout
+              ? `Media download timed out — instance "${this.instance.name}" is not connected`
+              : `Instance "${this.instance.name}" is not connected and CDN download failed: ${(cdnErr as Error).message}`,
           );
-          const chunks = [];
-          for await (const chunk of media) {
-            chunks.push(chunk);
+        }
+      } else {
+        try {
+          buffer = await raceTimeout(
+            downloadMediaMessage(
+              { key: msg?.key, message: msg?.message },
+              'buffer',
+              {},
+              { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+            ),
+          );
+        } catch (primaryErr) {
+          if ((primaryErr as Error)?.['code'] === 'ETIMEOUT') {
+            throw new BadRequestException(
+              `Media download timed out after ${timeoutMs / 1000}s for instance "${this.instance.name}"`,
+            );
           }
-          buffer = Buffer.concat(chunks);
-          this.logger.info('Download Media with downloadContentFromMessage was successful!');
-        } catch (fallbackErr) {
-          this.logger.error('Download Media with downloadContentFromMessage also failed!');
-          throw fallbackErr;
+          this.logger.error('Download Media failed, trying CDN fallback after 5 seconds...');
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+          try {
+            buffer = await raceTimeout(cdnDownload());
+            this.logger.info('Download Media with downloadContentFromMessage was successful!');
+          } catch (fallbackErr) {
+            if ((fallbackErr as Error)?.['code'] === 'ETIMEOUT') {
+              throw new BadRequestException(
+                `Media CDN fallback timed out after ${timeoutMs / 1000}s for instance "${this.instance.name}"`,
+              );
+            }
+            this.logger.error('Download Media with downloadContentFromMessage also failed!');
+            throw fallbackErr;
+          }
         }
       }
+
       const typeMessage = getContentType(msg.message);
 
       const ext = mimeTypes.extension(mediaMessage?.['mimetype']);
