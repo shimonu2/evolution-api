@@ -13,6 +13,8 @@ import P from 'pino';
 
 import { BaseChatbotService } from '../../base-chatbot.service';
 
+const HTTP_TIMEOUT_MS = 30_000;
+
 /**
  * OpenAI service that extends the common BaseChatbotService
  * Handles both Assistant API and ChatCompletion API
@@ -35,7 +37,7 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
    * Initialize the OpenAI client with the provided API key
    */
   protected initClient(apiKey: string) {
-    this.client = new OpenAI({ apiKey });
+    this.client = new OpenAI({ apiKey, timeout: HTTP_TIMEOUT_MS });
     return this.client;
   }
 
@@ -287,7 +289,10 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
         let mediaBase64 = msg.message.base64 || null;
 
         if (msg.message.mediaUrl && isURL(msg.message.mediaUrl)) {
-          const result = await axios.get(msg.message.mediaUrl, { responseType: 'arraybuffer' });
+          const result = await axios.get(msg.message.mediaUrl, {
+            responseType: 'arraybuffer',
+            timeout: HTTP_TIMEOUT_MS,
+          });
           mediaBase64 = Buffer.from(result.data).toString('base64');
         }
 
@@ -594,17 +599,25 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
   ) {
     let status = await this.client.beta.threads.runs.retrieve(threadId, runId);
 
-    let maxRetries = 60; // 1 minute with 1s intervals
-    const checkInterval = 1000; // 1 second
+    // Bound by wall-clock time, not iteration count — otherwise a sluggish
+    // OpenAI API combined with the 30s per-call SDK timeout could stack up to
+    // 30min per assistant run. Default 90s; overridable via env.
+    const runBudgetMs = Number(process.env.OPENAI_ASSISTANT_BUDGET_MS ?? 90_000);
+    const deadline = Date.now() + runBudgetMs;
+    const initialInterval = 1_000;
+    const maxInterval = 5_000;
 
     while (
       status.status !== 'completed' &&
       status.status !== 'failed' &&
       status.status !== 'cancelled' &&
       status.status !== 'expired' &&
-      maxRetries > 0
+      Date.now() < deadline
     ) {
-      await new Promise((resolve) => setTimeout(resolve, checkInterval));
+      // Back off polling interval so we don't hammer the API when the run is slow.
+      const elapsed = runBudgetMs - (deadline - Date.now());
+      const interval = Math.min(initialInterval + Math.floor(elapsed / 10_000) * 1_000, maxInterval);
+      await new Promise((resolve) => setTimeout(resolve, interval));
       status = await this.client.beta.threads.runs.retrieve(threadId, runId);
 
       // Handle tool calls
@@ -621,10 +634,14 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
               payloadData.remoteJid = remoteJid;
               payloadData.pushName = pushName;
 
-              const response = await axios.post(functionUrl, {
-                functionName: toolCall.function.name,
-                functionArguments: payloadData,
-              });
+              const response = await axios.post(
+                functionUrl,
+                {
+                  functionName: toolCall.function.name,
+                  functionArguments: payloadData,
+                },
+                { timeout: HTTP_TIMEOUT_MS },
+              );
 
               toolOutputs.push({
                 tool_call_id: toolCall.id,
@@ -649,8 +666,6 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
           tool_outputs: toolOutputs,
         });
       }
-
-      maxRetries--;
     }
 
     if (status.status === 'completed') {
@@ -693,9 +708,11 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
     let audio: Buffer;
 
     if (msg.message.mediaUrl) {
-      audio = await axios.get(msg.message.mediaUrl, { responseType: 'arraybuffer' }).then((response) => {
-        return Buffer.from(response.data, 'binary');
-      });
+      audio = await axios
+        .get(msg.message.mediaUrl, { responseType: 'arraybuffer', timeout: HTTP_TIMEOUT_MS })
+        .then((response) => {
+          return Buffer.from(response.data, 'binary');
+        });
     } else if (msg.message.base64) {
       audio = Buffer.from(msg.message.base64, 'base64');
     } else {
@@ -727,6 +744,7 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
         'Content-Type': 'multipart/form-data',
         Authorization: `Bearer ${apiKey}`,
       },
+      timeout: HTTP_TIMEOUT_MS,
     });
 
     return response?.data?.text;

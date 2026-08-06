@@ -122,29 +122,35 @@ export class WebhookController extends EventController implements EventControlle
           this.logger.log(logData);
         }
 
-        try {
-          if (instance?.enabled && regex.test(instance.url)) {
-            const httpService = axios.create({
-              baseURL,
-              headers: webhookHeaders as Record<string, string> | undefined,
-              timeout: webhookConfig.REQUEST?.TIMEOUT_MS ?? 30000,
-            });
-
-            await this.retryWebhookRequest(httpService, webhookData, `${origin}.sendData-Webhook`, baseURL, serverUrl);
-          }
-        } catch (error) {
-          this.logger.error({
-            local: `${origin}.sendData-Webhook`,
-            message: `Todas as tentativas falharam: ${error?.message}`,
-            hostName: error?.hostname,
-            syscall: error?.syscall,
-            code: error?.code,
-            error: error?.errno,
-            stack: error?.stack,
-            name: error?.name,
-            url: baseURL,
-            server_url: serverUrl,
+        if (instance?.enabled && regex.test(instance.url)) {
+          const httpService = axios.create({
+            baseURL,
+            headers: webhookHeaders as Record<string, string> | undefined,
+            timeout: webhookConfig.REQUEST?.TIMEOUT_MS ?? 30000,
           });
+
+          // Fire-and-forget: the retry loop can sleep up to 5 min between
+          // attempts and up to 10 attempts total (~25 min worst case). If we
+          // awaited it, every event would block the message-receive pipeline
+          // for as long as its webhook retried. Retries and their errors
+          // are logged inside retryWebhookRequest; top-level catch only
+          // keeps an unhandled rejection from slipping out.
+          this.retryWebhookRequest(httpService, webhookData, `${origin}.sendData-Webhook`, baseURL, serverUrl).catch(
+            (error) => {
+              this.logger.error({
+                local: `${origin}.sendData-Webhook`,
+                message: `Todas as tentativas falharam: ${error?.message}`,
+                hostName: error?.hostname,
+                syscall: error?.syscall,
+                code: error?.code,
+                error: error?.errno,
+                stack: error?.stack,
+                name: error?.name,
+                url: baseURL,
+                server_url: serverUrl,
+              });
+            },
+          );
         }
       }
     }
@@ -167,33 +173,32 @@ export class WebhookController extends EventController implements EventControlle
           this.logger.log(logData);
         }
 
-        try {
-          if (regex.test(globalURL)) {
-            const httpService = axios.create({
-              baseURL: globalURL,
-              timeout: webhookConfig.REQUEST?.TIMEOUT_MS ?? 30000,
-            });
+        if (regex.test(globalURL)) {
+          const httpService = axios.create({
+            baseURL: globalURL,
+            timeout: webhookConfig.REQUEST?.TIMEOUT_MS ?? 30000,
+          });
 
-            await this.retryWebhookRequest(
-              httpService,
-              webhookData,
-              `${origin}.sendData-Webhook-Global`,
-              globalURL,
-              serverUrl,
-            );
-          }
-        } catch (error) {
-          this.logger.error({
-            local: `${origin}.sendData-Webhook-Global`,
-            message: `Todas as tentativas falharam: ${error?.message}`,
-            hostName: error?.hostname,
-            syscall: error?.syscall,
-            code: error?.code,
-            error: error?.errno,
-            stack: error?.stack,
-            name: error?.name,
-            url: globalURL,
-            server_url: serverUrl,
+          // Same fire-and-forget rationale as local webhook above.
+          this.retryWebhookRequest(
+            httpService,
+            webhookData,
+            `${origin}.sendData-Webhook-Global`,
+            globalURL,
+            serverUrl,
+          ).catch((error) => {
+            this.logger.error({
+              local: `${origin}.sendData-Webhook-Global`,
+              message: `Todas as tentativas falharam: ${error?.message}`,
+              hostName: error?.hostname,
+              syscall: error?.syscall,
+              code: error?.code,
+              error: error?.errno,
+              stack: error?.stack,
+              name: error?.name,
+              url: globalURL,
+              server_url: serverUrl,
+            });
           });
         }
       }

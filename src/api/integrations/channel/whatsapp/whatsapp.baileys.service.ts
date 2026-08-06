@@ -241,8 +241,19 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private authStateProvider: AuthStateProvider;
-  private readonly msgRetryCounterCache: CacheStore = new NodeCache();
-  private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
+  // Promise-chain mutex: serializes saveCreds() calls per instance so two
+  // creds.update events arriving back-to-back (common during multidevice
+  // sync) cannot interleave their writes and corrupt the auth state.
+  private saveCredsChain: Promise<void> = Promise.resolve();
+  // Both caches are per-instance. TTLs cap long-run memory growth — a
+  // long-lived instance otherwise accumulates retry counters and device
+  // records for every remote JID it ever interacted with.
+  // msgRetryCounterCache: 1h is enough for Baileys' protocol-level retry logic;
+  // entries that haven't been touched in an hour are stale.
+  // userDevicesCache: 5min TTL stays aligned with Baileys' recommended value;
+  // useClones:false keeps raw references to avoid cloning large device lists.
+  private readonly msgRetryCounterCache: CacheStore = new NodeCache({ stdTTL: 3_600, checkperiod: 600 });
+  private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
@@ -260,6 +271,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.stopAllCronTasks();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -326,11 +338,31 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
+  // Absolute wall-clock budget for one pairing attempt. Without it, an
+  // abandoned session (browser closed, user walked away) keeps generating QRs
+  // and requesting pairing codes until it hits the count LIMIT — potentially
+  // hours if LIMIT is high. Resets on successful connection.
+  private pairingStartedAt: number | null = null;
+  private readonly PAIRING_BUDGET_MS = Number(process.env.PAIRING_BUDGET_MS ?? 5 * 60_000);
+
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
     if (qr) {
-      if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
+      // Start the pairing clock on the first QR of an attempt.
+      if (this.pairingStartedAt === null) {
+        this.pairingStartedAt = Date.now();
+      }
+
+      const pairingElapsed = Date.now() - this.pairingStartedAt;
+      const countLimit = this.configService.get<QrCode>('QRCODE').LIMIT;
+      const budgetExceeded = pairingElapsed >= this.PAIRING_BUDGET_MS;
+
+      if (this.instance.qrcode.count === countLimit || budgetExceeded) {
+        const reason = budgetExceeded
+          ? `pairing budget exceeded (${pairingElapsed}ms ≥ ${this.PAIRING_BUDGET_MS}ms)`
+          : 'QR code limit reached, please login again';
+        this.logger.warn(`Abandoning pairing for instance "${this.instance.name}": ${reason}`);
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
-          message: 'QR code limit reached, please login again',
+          message: reason,
           statusCode: DisconnectReason.badSession,
         });
 
@@ -338,7 +370,7 @@ export class BaileysStartupService extends ChannelStartupService {
           this.chatwootService.eventWhatsapp(
             Events.QRCODE_UPDATED,
             { instanceName: this.instance.name, instanceId: this.instanceId },
-            { message: 'QR code limit reached, please login again', statusCode: DisconnectReason.badSession },
+            { message: reason, statusCode: DisconnectReason.badSession },
           );
         }
 
@@ -419,6 +451,11 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      // Reset the pairing clock — otherwise a failed pairing attempt (socket
+      // closed before the user scanned) leaves a stale pairingStartedAt, and
+      // the next attempt's first QR would instantly blow the budget.
+      this.pairingStartedAt = null;
+
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
@@ -452,14 +489,25 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
-        this.client?.ws?.close();
-        this.client.end(new Error('Close connection'));
+        try {
+          this.client?.ws?.close();
+        } catch (e) {
+          this.logger.warn(`ws.close() failed: ${(e as Error)?.message ?? e}`);
+        }
+        try {
+          this.client?.end?.(new Error('Close connection'));
+        } catch (e) {
+          this.logger.warn(`client.end() failed: ${(e as Error)?.message ?? e}`);
+        }
 
         this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
       }
     }
 
     if (connection === 'open') {
+      // Reset the pairing clock on successful connection so the next
+      // disconnect-then-pair cycle starts fresh.
+      this.pairingStartedAt = null;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -574,17 +622,17 @@ export class BaileysStartupService extends ChannelStartupService {
     // ========== CUSTOM BROWSER SIMULATION ==========
     // Based on real browser capture from your laptop
     // Captured on: 2026-01-03
-    // Browser: Chrome 143.0.0.0 Mobile (Nexus 5 emulation)
+    // Browser: Chrome 147.0.7727.55 Mobile (Nexus 5 emulation)
     // ================================================
 
     // Exact browser description from your capture
-    const browserDescription: WABrowserDescription = ['Chrome', '143.0.0.0', 'Android'];
+    const browserDescription: WABrowserDescription = ['Chrome', '147.0.7727.55', 'Android'];
 
     if (number || this.phoneNumber) {
       this.phoneNumber = number;
       this.logger.info(`Phone number: ${number}`);
     } else {
-      this.logger.info(`Using custom browser simulation - Chrome 143.0.0.0 Mobile`);
+      this.logger.info(`Using custom browser simulation - Chrome 147.0.7727.55 Mobile`);
     }
 
     // Get the latest WhatsApp Web version with fallback
@@ -630,6 +678,20 @@ export class BaileysStartupService extends ChannelStartupService {
       },
     };
 
+    // Defensively close the previous socket before creating a new one.
+    // Baileys normally does this internally, but reconnect paths can race and
+    // leave a zombie socket holding the auth-state file lock.
+    if (this.client) {
+      try {
+        this.client.ev?.removeAllListeners?.('connection.update');
+        this.client.ws?.removeAllListeners?.();
+        this.client.ws?.close?.();
+        this.client.end?.(new Error('Creating new socket'));
+      } catch (e) {
+        this.logger.warn(`Previous-socket cleanup failed: ${(e as Error)?.message ?? e}`);
+      }
+    }
+
     // Create the socket with enhanced configuration
     const sock = makeWASocket({
       ...socketConfig,
@@ -639,30 +701,11 @@ export class BaileysStartupService extends ChannelStartupService {
       },
     });
 
-    // Add event listeners for connection state
-    sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect, qr } = update;
-
-      if (connection === 'close') {
-        const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== 401;
-        this.logger.warn(`Connection closed due to ${lastDisconnect?.error}, reconnecting ${shouldReconnect}`);
-
-        if (shouldReconnect) {
-          // Reconnect after a delay (human-like behavior)
-          const delay = Math.floor(Math.random() * 2000) + 1000; // 1-3 seconds
-          setTimeout(() => this.createClient(number), delay);
-        }
-      } else if (connection === 'open') {
-        this.logger.info('Successfully connected to WhatsApp Web');
-        this.logger.info(`Browser: Chrome 143.0.0.0 Mobile (Android)`);
-        this.logger.info(`Language: en-US,en,he,ar`);
-        this.logger.info(`Timezone: Asia/Jerusalem`);
-      }
-
-      if (qr) {
-        this.logger.info('QR code received, please scan it');
-      }
-    });
+    // Note: connection.update is handled exclusively by connectionUpdate() via
+    // eventHandler() below. A second inline listener used to duplicate that
+    // logic with weaker reconnect criteria, which caused a race where two
+    // reconnects fired on every disconnect and corrupted auth state. Do not
+    // re-introduce an inline connection.update listener here.
 
     this.logger.info(`Using WhatsApp Web version: ${waVersion.version.join('.')}`);
     this.logger.info(`Group Ignore: ${this.localSettings?.groupsIgnore || 'not set'}`);
@@ -871,6 +914,9 @@ export class BaileysStartupService extends ChannelStartupService {
     'contacts.update': async (contacts: Partial<Contact>[]) => {
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
       for await (const contact of contacts) {
+        // Skip @lid contacts — canonical record lives under @s.whatsapp.net,
+        // maintained by messages.upsert with normalizedRemoteJid.
+        if (contact.id?.includes('@lid')) continue;
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
         contactsRaw.push({
           remoteJid: contact.id,
@@ -1417,18 +1463,27 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (this.localWebhook.enabled) {
             if (isMedia && this.localWebhook.webhookBase64) {
-              try {
-                const buffer = await downloadMediaMessage(
-                  { key: received.key, message: received?.message },
-                  'buffer',
-                  {},
-                  { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
-                );
+              // Skip base64 inlining for media above WA_MEDIA_MAX_BYTES
+              // (default 50mb). A 100mb WA document otherwise allocates
+              // 100mb of buffer + ~133mb of base64 in memory on every
+              // inbound message — 10 concurrent messages = 2gb peak, OOM
+              // on any container smaller than 4gb.
+              const maxBytes = Number(process.env.WA_MEDIA_MAX_BYTES ?? 50 * 1024 * 1024);
+              const anyMsg: any = received?.message ?? {};
+              const mediaNode =
+                anyMsg.imageMessage ||
+                anyMsg.videoMessage ||
+                anyMsg.audioMessage ||
+                anyMsg.documentMessage ||
+                anyMsg.stickerMessage;
+              const fileLength = Number(mediaNode?.fileLength ?? 0);
 
-                if (buffer) {
-                  messageRaw.message.base64 = buffer.toString('base64');
-                } else {
-                  // retry to download media
+              if (fileLength > 0 && fileLength > maxBytes) {
+                this.logger.warn(
+                  `Skipping base64 inline for ${received.key?.id}: fileLength ${fileLength} > ${maxBytes}`,
+                );
+              } else {
+                try {
                   const buffer = await downloadMediaMessage(
                     { key: received.key, message: received?.message },
                     'buffer',
@@ -1436,12 +1491,28 @@ export class BaileysStartupService extends ChannelStartupService {
                     { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
                   );
 
-                  if (buffer) {
+                  if (buffer && buffer.length <= maxBytes) {
                     messageRaw.message.base64 = buffer.toString('base64');
+                  } else if (buffer && buffer.length > maxBytes) {
+                    this.logger.warn(
+                      `Downloaded media for ${received.key?.id} is ${buffer.length}B > ${maxBytes}B — not inlining`,
+                    );
+                  } else {
+                    // retry to download media
+                    const retry = await downloadMediaMessage(
+                      { key: received.key, message: received?.message },
+                      'buffer',
+                      {},
+                      { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+                    );
+
+                    if (retry && retry.length <= maxBytes) {
+                      messageRaw.message.base64 = retry.toString('base64');
+                    }
                   }
+                } catch (error) {
+                  this.logger.error(['Error converting media to base64', error?.message]);
                 }
-              } catch (error) {
-                this.logger.error(['Error converting media to base64', error?.message]);
               }
             }
           }
@@ -1449,22 +1520,40 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
-          if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
-            messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
+          // Normalize LID JID without mutating the original key object.
+          // Protobuf-derived keys can have a read-only remoteJid property;
+          // an in-place assignment throws a TypeError that the outer
+          // try-catch swallows, silently skipping the webhook dispatch.
+          // Spreading creates a new plain-JS object where remoteJid is writable.
+          const normalizedRemoteJid =
+            messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt
+              ? messageRaw.key.remoteJidAlt
+              : messageRaw.key.remoteJid;
+          if (normalizedRemoteJid !== messageRaw.key.remoteJid) {
+            this.logger.info(
+              `LID addressing: normalizing remoteJid ${messageRaw.key.remoteJid} → ${normalizedRemoteJid}`,
+            );
+          } else if (messageRaw.key.remoteJid?.includes('@lid')) {
+            this.logger.warn(
+              `LID addressing: remoteJid=${messageRaw.key.remoteJid} has no remoteJidAlt — webhook will contain raw LID JID`,
+            );
           }
-          console.log(messageRaw);
+          const dispatchPayload =
+            normalizedRemoteJid !== messageRaw.key.remoteJid
+              ? { ...messageRaw, key: { ...messageRaw.key, remoteJid: normalizedRemoteJid } }
+              : messageRaw;
 
-          this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+          this.sendDataWebhook(Events.MESSAGES_UPSERT, dispatchPayload);
 
           await chatbotController.emit({
             instance: { instanceName: this.instance.name, instanceId: this.instanceId },
-            remoteJid: messageRaw.key.remoteJid,
-            msg: messageRaw,
+            remoteJid: normalizedRemoteJid,
+            msg: dispatchPayload,
             pushName: messageRaw.pushName,
           });
 
           const contact = await this.prismaRepository.contact.findFirst({
-            where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
+            where: { remoteJid: normalizedRemoteJid, instanceId: this.instanceId },
           });
 
           const contactRaw: {
@@ -1473,9 +1562,9 @@ export class BaileysStartupService extends ChannelStartupService {
             profilePicUrl?: string;
             instanceId: string;
           } = {
-            remoteJid: received.key.remoteJid,
+            remoteJid: normalizedRemoteJid,
             pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
+            profilePicUrl: (await this.profilePicture(normalizedRemoteJid)).profilePictureUrl,
             instanceId: this.instanceId,
           };
 
@@ -1846,141 +1935,220 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  // Pre-send guard: refuse to hand a message to a dead socket. Baileys will
+  // silently queue writes when the WS is closed and the caller never finds
+  // out the message went nowhere. Wait briefly for open, then fail fast.
+  //
+  // Backwards-compat opt-out: ENSURE_CONNECTED_ON_SEND=false restores the
+  // pre-0414 behavior of letting Baileys silently queue against a dead
+  // socket. Only set this if your callers were previously relying on
+  // "fire and pray" semantics and you can't change them.
+  private async ensureConnected(timeoutMs = 5_000): Promise<void> {
+    if (process.env.ENSURE_CONNECTED_ON_SEND === 'false') return;
+    if (this.stateConnection?.state === 'open' && this.client?.user) return;
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.stateConnection?.state === 'open' && this.client?.user) return;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    throw new BadRequestException(
+      `Instance "${this.instance.name}" is not connected (state=${this.stateConnection?.state ?? 'unknown'})`,
+    );
+  }
+
+  // Conservative retry: only retry on transport errors that clearly indicate
+  // the message did NOT reach the server (ECONNRESET, WebSocket closed).
+  // Never retry blind — duplicate sends are a worse bug than a lost one.
+  //
+  // Total wall-clock cap of ~6s (5s first ensure + 500ms backoff + ~500ms
+  // second ensure) so a single send can't park a request for >10s under a
+  // flapping connection.
+  private async sendWithRetry<T>(op: () => Promise<T>, label: string, maxAttempts = 2): Promise<T> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        // Give the first attempt a generous 5s window; subsequent attempts
+        // assume we just waited and the socket should be ready or not
+        // imminently — cap at 500ms so two retries never stack to 10s.
+        const connectBudget = attempt === 1 ? 5_000 : 500;
+        await this.ensureConnected(connectBudget);
+        return await op();
+      } catch (err) {
+        lastErr = err;
+        const msg = (err as Error)?.message ?? '';
+        const isTransient =
+          msg.includes('ECONNRESET') ||
+          msg.includes('ETIMEDOUT') ||
+          msg.includes('WebSocket was closed') ||
+          msg.includes('Connection Closed') ||
+          msg.includes('Stream Errored');
+        if (!isTransient || attempt === maxAttempts) {
+          throw err;
+        }
+        const backoff = 500 * attempt;
+        this.logger.warn(
+          `sendMessage "${label}" transient failure (attempt ${attempt}): ${msg} — retry in ${backoff}ms`,
+        );
+        await new Promise((r) => setTimeout(r, backoff));
+      }
+    }
+    throw lastErr;
+  }
+
+  private saveCredsSerialized(): Promise<void> {
+    // Sequentialize writes, but keep the *internal* chain always-resolved so
+    // one failed saveCreds() can't leave the chain in a rejected state that
+    // quietly skips every subsequent attempt via an onRejected branch.
+    //
+    // - `next` preserves the rejection so the caller can await it and log.
+    // - `saveCredsChain` is the same promise with a .catch(), so it is
+    //   always resolved by the time the next call chains off it.
+    const next = this.saveCredsChain.then(async () => {
+      await this.instance.authState?.saveCreds?.();
+    });
+    this.saveCredsChain = next.catch((err) => {
+      this.logger.error(`saveCreds failed: ${(err as Error)?.message ?? err}`);
+    });
+    return next;
+  }
+
   private eventHandler() {
     this.client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
-        try {
-          if (!this.endSession) {
-            const database = this.configService.get<Database>('DATABASE');
-            const settings = await this.findSettings();
+        if (this.endSession) return;
 
-            if (events.call) {
-              const call = events.call[0];
-
-              if (settings?.rejectCall && call.status == 'offer') {
-                this.client.rejectCall(call.id, call.from);
-              }
-
-              if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-                if (call.from.endsWith('@lid')) {
-                  call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
-                }
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
-
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
-              }
-
-              this.sendDataWebhook(Events.CALL, call);
-            }
-
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
-            }
-
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
-            }
-
-            if (events['messaging-history.set']) {
-              const payload = events['messaging-history.set'];
-              await this.messageHandle['messaging-history.set'](payload);
-            }
-
-            if (events['messages.upsert']) {
-              const payload = events['messages.upsert'];
-
-              // this.messageProcessor.processMessage(payload, settings);
-              await this.messageHandle['messages.upsert'](payload, settings);
-            }
-
-            if (events['messages.update']) {
-              const payload = events['messages.update'];
-              await this.messageHandle['messages.update'](payload, settings);
-            }
-
-            if (events['message-receipt.update']) {
-              const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap: Record<string, number> = {};
-
-              for (const event of payload) {
-                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
-                }
-              }
-
-              await Promise.all(
-                Object.keys(remotesJidMap).map(async (remoteJid) =>
-                  this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-                ),
-              );
-            }
-
-            if (events['presence.update']) {
-              const payload = events['presence.update'];
-
-              if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
-                return;
-              }
-
-              this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-            }
-
-            if (!settings?.groupsIgnore) {
-              if (events['groups.upsert']) {
-                const payload = events['groups.upsert'];
-                this.groupHandler['groups.upsert'](payload);
-              }
-
-              if (events['groups.update']) {
-                const payload = events['groups.update'];
-                this.groupHandler['groups.update'](payload);
-              }
-
-              if (events['group-participants.update']) {
-                const payload = events['group-participants.update'] as any;
-                this.groupHandler['group-participants.update'](payload);
-              }
-            }
-
-            if (events['chats.upsert']) {
-              const payload = events['chats.upsert'];
-              this.chatHandle['chats.upsert'](payload);
-            }
-
-            if (events['chats.update']) {
-              const payload = events['chats.update'];
-              this.chatHandle['chats.update'](payload);
-            }
-
-            if (events['chats.delete']) {
-              const payload = events['chats.delete'];
-              this.chatHandle['chats.delete'](payload);
-            }
-
-            if (events['contacts.upsert']) {
-              const payload = events['contacts.upsert'];
-              this.contactHandle['contacts.upsert'](payload);
-            }
-
-            if (events['contacts.update']) {
-              const payload = events['contacts.update'];
-              this.contactHandle['contacts.update'](payload);
-            }
-
-            if (events[Events.LABELS_ASSOCIATION]) {
-              const payload = events[Events.LABELS_ASSOCIATION];
-              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-              return;
-            }
-
-            if (events[Events.LABELS_EDIT]) {
-              const payload = events[Events.LABELS_EDIT];
-              this.labelHandle[Events.LABELS_EDIT](payload);
-              return;
-            }
+        const instanceName = this.instance.name;
+        // Isolate each event branch so a thrown error from one handler cannot
+        // break the shared eventProcessingQueue for this instance — previously
+        // a failure in (say) messages.upsert would also skip every subsequent
+        // event in the same batch.
+        const runSafe = async (eventName: string, fn: () => void | Promise<unknown>) => {
+          try {
+            await fn();
+          } catch (error) {
+            this.logger.error({ eventName, instanceName, error });
           }
+        };
+
+        const database = this.configService.get<Database>('DATABASE');
+        let settings: any = null;
+        try {
+          settings = await this.findSettings();
         } catch (error) {
-          this.logger.error(error);
+          this.logger.error({ eventName: 'findSettings', instanceName, error });
+        }
+
+        if (events.call) {
+          await runSafe('call', async () => {
+            const call = events.call[0];
+
+            if (settings?.rejectCall && call.status == 'offer') {
+              this.client.rejectCall(call.id, call.from);
+            }
+
+            if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+              if (call.from.endsWith('@lid')) {
+                call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+              }
+              const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+
+              this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+            }
+
+            this.sendDataWebhook(Events.CALL, call);
+          });
+        }
+
+        if (events['connection.update']) {
+          await runSafe('connection.update', () => this.connectionUpdate(events['connection.update']));
+        }
+
+        if (events['creds.update']) {
+          await runSafe('creds.update', () => this.saveCredsSerialized());
+        }
+
+        if (events['messaging-history.set']) {
+          await runSafe('messaging-history.set', () =>
+            this.messageHandle['messaging-history.set'](events['messaging-history.set']),
+          );
+        }
+
+        if (events['messages.upsert']) {
+          await runSafe('messages.upsert', () =>
+            this.messageHandle['messages.upsert'](events['messages.upsert'], settings),
+          );
+        }
+
+        if (events['messages.update']) {
+          await runSafe('messages.update', () =>
+            this.messageHandle['messages.update'](events['messages.update'], settings),
+          );
+        }
+
+        if (events['message-receipt.update']) {
+          await runSafe('message-receipt.update', async () => {
+            const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
+            const remotesJidMap: Record<string, number> = {};
+
+            for (const event of payload) {
+              if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+                remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+              }
+            }
+
+            await Promise.all(
+              Object.keys(remotesJidMap).map((remoteJid) =>
+                this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+              ),
+            );
+          });
+        }
+
+        if (events['presence.update']) {
+          await runSafe('presence.update', () => {
+            const payload = events['presence.update'];
+            if (settings?.groupsIgnore && payload.id.includes('@g.us')) return;
+            this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+          });
+        }
+
+        if (!settings?.groupsIgnore) {
+          if (events['groups.upsert']) {
+            await runSafe('groups.upsert', () => this.groupHandler['groups.upsert'](events['groups.upsert']));
+          }
+          if (events['groups.update']) {
+            await runSafe('groups.update', () => this.groupHandler['groups.update'](events['groups.update']));
+          }
+          if (events['group-participants.update']) {
+            await runSafe('group-participants.update', () =>
+              this.groupHandler['group-participants.update'](events['group-participants.update'] as any),
+            );
+          }
+        }
+
+        if (events['chats.upsert']) {
+          await runSafe('chats.upsert', () => this.chatHandle['chats.upsert'](events['chats.upsert']));
+        }
+        if (events['chats.update']) {
+          await runSafe('chats.update', () => this.chatHandle['chats.update'](events['chats.update']));
+        }
+        if (events['chats.delete']) {
+          await runSafe('chats.delete', () => this.chatHandle['chats.delete'](events['chats.delete']));
+        }
+        if (events['contacts.upsert']) {
+          await runSafe('contacts.upsert', () => this.contactHandle['contacts.upsert'](events['contacts.upsert']));
+        }
+        if (events['contacts.update']) {
+          await runSafe('contacts.update', () => this.contactHandle['contacts.update'](events['contacts.update']));
+        }
+        if (events[Events.LABELS_ASSOCIATION]) {
+          await runSafe(Events.LABELS_ASSOCIATION, () =>
+            this.labelHandle[Events.LABELS_ASSOCIATION](events[Events.LABELS_ASSOCIATION], database),
+          );
+        }
+        if (events[Events.LABELS_EDIT]) {
+          await runSafe(Events.LABELS_EDIT, () => this.labelHandle[Events.LABELS_EDIT](events[Events.LABELS_EDIT]));
         }
       });
     });
@@ -2154,12 +2322,16 @@ export class BaileysStartupService extends ChannelStartupService {
       sender !== 'status@broadcast'
     ) {
       if (message['reactionMessage']) {
-        return await this.client.sendMessage(
-          sender,
-          {
-            react: { text: message['reactionMessage']['text'], key: message['reactionMessage']['key'] },
-          } as unknown as AnyMessageContent,
-          option as unknown as MiscMessageGenerationOptions,
+        return await this.sendWithRetry(
+          () =>
+            this.client.sendMessage(
+              sender,
+              {
+                react: { text: message['reactionMessage']['text'], key: message['reactionMessage']['key'] },
+              } as unknown as AnyMessageContent,
+              option as unknown as MiscMessageGenerationOptions,
+            ),
+          'reaction',
         );
       }
     }
@@ -2169,27 +2341,35 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (message['conversation']) {
-      return await this.client.sendMessage(
-        sender,
-        {
-          text: message['conversation'],
-          mentions,
-          linkPreview: linkPreview,
-          contextInfo: message['contextInfo'],
-        } as unknown as AnyMessageContent,
-        option as unknown as MiscMessageGenerationOptions,
+      return await this.sendWithRetry(
+        () =>
+          this.client.sendMessage(
+            sender,
+            {
+              text: message['conversation'],
+              mentions,
+              linkPreview: linkPreview,
+              contextInfo: message['contextInfo'],
+            } as unknown as AnyMessageContent,
+            option as unknown as MiscMessageGenerationOptions,
+          ),
+        'conversation',
       );
     }
 
     if (!message['audio'] && !message['poll'] && !message['sticker'] && sender != 'status@broadcast') {
-      return await this.client.sendMessage(
-        sender,
-        {
-          forward: { key: { remoteJid: this.instance.wuid, fromMe: true }, message },
-          mentions,
-          contextInfo: message['contextInfo'],
-        },
-        option as unknown as MiscMessageGenerationOptions,
+      return await this.sendWithRetry(
+        () =>
+          this.client.sendMessage(
+            sender,
+            {
+              forward: { key: { remoteJid: this.instance.wuid, fromMe: true }, message },
+              mentions,
+              contextInfo: message['contextInfo'],
+            },
+            option as unknown as MiscMessageGenerationOptions,
+          ),
+        'forward',
       );
     }
 
@@ -2233,9 +2413,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if (batches.length === 0) return firstMessage;
 
-      await Promise.allSettled(
-        batches.map(async (batch) => {
-          const messageSent = await this.client.sendMessage(
+      // Send status batches sequentially with an inter-batch delay instead of
+      // a parallel Promise.allSettled. Fanning 100+ sends in parallel is a
+      // reliable way to trip WhatsApp's spam heuristics and get the number
+      // banned. Default rate ≈ 5 batches/sec; tune via STATUS_BATCH_DELAY_MS.
+      const interBatchDelay = Number(process.env.STATUS_BATCH_DELAY_MS ?? 200);
+      for (const batch of batches) {
+        try {
+          await this.client.sendMessage(
             sender,
             message['status'].content as unknown as AnyMessageContent,
             {
@@ -2245,18 +2430,23 @@ export class BaileysStartupService extends ChannelStartupService {
               messageId: msgId,
             } as unknown as MiscMessageGenerationOptions,
           );
-
-          return messageSent;
-        }),
-      );
+        } catch (err) {
+          this.logger.error(`Status batch send failed (batch size=${batch.length}): ${(err as Error)?.message ?? err}`);
+        }
+        if (interBatchDelay > 0) await new Promise((r) => setTimeout(r, interBatchDelay));
+      }
 
       return firstMessage;
     }
 
-    return await this.client.sendMessage(
-      sender,
-      message as unknown as AnyMessageContent,
-      option as unknown as MiscMessageGenerationOptions,
+    return await this.sendWithRetry(
+      () =>
+        this.client.sendMessage(
+          sender,
+          message as unknown as AnyMessageContent,
+          option as unknown as MiscMessageGenerationOptions,
+        ),
+      'default',
     );
   }
 
@@ -3809,6 +3999,21 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
+    // Configurable download timeout; default 30 s. Prevents indefinite hangs when
+    // the WhatsApp session is down or the CDN is unresponsive.
+    const timeoutMs = parseInt(process.env.MEDIA_DOWNLOAD_TIMEOUT_MS ?? '30000', 10);
+    const raceTimeout = <T>(p: Promise<T>): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout>;
+      const timeout = new Promise<never>((_, rej) => {
+        timer = setTimeout(
+          () =>
+            rej(Object.assign(new Error(`Media download timed out after ${timeoutMs / 1000}s`), { code: 'ETIMEOUT' })),
+          timeoutMs,
+        );
+      });
+      return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+    };
+
     try {
       const m = data?.message;
       const convertToMp4 = data?.convertToMp4 ?? false;
@@ -3867,42 +4072,83 @@ export class BaileysStartupService extends ChannelStartupService {
         msg.message[mediaType].mediaKey = Uint8Array.from(Object.values(mediaMessage['mediaKey']));
       }
 
+      // Determine session state before choosing a download path.
+      // When disconnected, reuploadRequest (which requires an active WebSocket) must be
+      // skipped — calling it on a dead socket hangs indefinitely with no response.
+      // downloadContentFromMessage uses plain HTTPS and works without an active session
+      // as long as the CDN URL has not expired.
+      const isConnected = this.stateConnection?.state === 'open' && !!this.client?.user;
+
+      const cdnDownload = async (): Promise<Buffer> => {
+        const resolvedType = Object.keys(msg.message).find((k) => k.endsWith('Message'));
+        if (!resolvedType) throw new Error('Could not determine mediaType for CDN download');
+        const media = await downloadContentFromMessage(
+          {
+            mediaKey: msg.message?.[resolvedType]?.mediaKey,
+            directPath: msg.message?.[resolvedType]?.directPath,
+            url: `https://mmg.whatsapp.net${msg?.message?.[resolvedType]?.directPath}`,
+          },
+          await this.mapMediaType(resolvedType),
+          {},
+        );
+        const chunks: Buffer[] = [];
+        for await (const chunk of media) {
+          chunks.push(chunk);
+        }
+        return Buffer.concat(chunks);
+      };
+
       let buffer: Buffer;
 
-      try {
-        buffer = await downloadMediaMessage(
-          { key: msg?.key, message: msg?.message },
-          'buffer',
-          {},
-          { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+      if (!isConnected) {
+        // Session is down — skip reuploadRequest to avoid hanging on a dead socket.
+        this.logger.warn(
+          `Instance "${this.instance.name}" is not connected (state=${this.stateConnection?.state ?? 'unknown'}) — attempting direct CDN download`,
         );
-      } catch {
-        this.logger.error('Download Media failed, trying to retry in 5 seconds...');
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-        const mediaType = Object.keys(msg.message).find((key) => key.endsWith('Message'));
-        if (!mediaType) throw new Error('Could not determine mediaType for fallback');
-
         try {
-          const media = await downloadContentFromMessage(
-            {
-              mediaKey: msg.message?.[mediaType]?.mediaKey,
-              directPath: msg.message?.[mediaType]?.directPath,
-              url: `https://mmg.whatsapp.net${msg?.message?.[mediaType]?.directPath}`,
-            },
-            await this.mapMediaType(mediaType),
-            {},
+          buffer = await raceTimeout(cdnDownload());
+          this.logger.info('Direct CDN download succeeded despite disconnected session.');
+        } catch (cdnErr) {
+          const isTimeout = (cdnErr as Error)?.['code'] === 'ETIMEOUT';
+          throw new BadRequestException(
+            isTimeout
+              ? `Media download timed out — instance "${this.instance.name}" is not connected`
+              : `Instance "${this.instance.name}" is not connected and CDN download failed: ${(cdnErr as Error).message}`,
           );
-          const chunks = [];
-          for await (const chunk of media) {
-            chunks.push(chunk);
+        }
+      } else {
+        try {
+          buffer = await raceTimeout(
+            downloadMediaMessage(
+              { key: msg?.key, message: msg?.message },
+              'buffer',
+              {},
+              { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+            ),
+          );
+        } catch (primaryErr) {
+          if ((primaryErr as Error)?.['code'] === 'ETIMEOUT') {
+            throw new BadRequestException(
+              `Media download timed out after ${timeoutMs / 1000}s for instance "${this.instance.name}"`,
+            );
           }
-          buffer = Buffer.concat(chunks);
-          this.logger.info('Download Media with downloadContentFromMessage was successful!');
-        } catch (fallbackErr) {
-          this.logger.error('Download Media with downloadContentFromMessage also failed!');
-          throw fallbackErr;
+          this.logger.error('Download Media failed, trying CDN fallback after 5 seconds...');
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+          try {
+            buffer = await raceTimeout(cdnDownload());
+            this.logger.info('Download Media with downloadContentFromMessage was successful!');
+          } catch (fallbackErr) {
+            if ((fallbackErr as Error)?.['code'] === 'ETIMEOUT') {
+              throw new BadRequestException(
+                `Media CDN fallback timed out after ${timeoutMs / 1000}s for instance "${this.instance.name}"`,
+              );
+            }
+            this.logger.error('Download Media with downloadContentFromMessage also failed!');
+            throw fallbackErr;
+          }
         }
       }
+
       const typeMessage = getContentType(msg.message);
 
       const ext = mimeTypes.extension(mediaMessage?.['mimetype']);
@@ -4258,6 +4504,15 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   // Group
+  // Per-instance group-metadata cache key. The underlying CacheService is
+  // shared (one Redis namespace), but two Baileys instances can be members
+  // of the same WA group with different membership / admin views, so a
+  // bare groupJid key would let them overwrite each other's metadata.
+  // Scope keys with the instance id.
+  private groupCacheKey(groupJid: string): string {
+    return `${this.instanceId}:${groupJid}`;
+  }
+
   private async updateGroupMetadataCache(groupJid: string) {
     try {
       const meta = await this.client.groupMetadata(groupJid);
@@ -4266,7 +4521,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
         this.logger.verbose(`Updating cache for group: ${groupJid}`);
-        await groupMetadataCache.set(groupJid, { timestamp: Date.now(), data: meta });
+        await groupMetadataCache.set(this.groupCacheKey(groupJid), { timestamp: Date.now(), data: meta });
       }
 
       return meta;
@@ -4282,9 +4537,10 @@ export class BaileysStartupService extends ChannelStartupService {
     const cacheConf = this.configService.get<CacheConf>('CACHE');
 
     if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
-      if (await groupMetadataCache?.has(groupJid)) {
-        console.log(`Cache request for group: ${groupJid}`);
-        const meta = await groupMetadataCache.get(groupJid);
+      const key = this.groupCacheKey(groupJid);
+      if (await groupMetadataCache?.has(key)) {
+        this.logger.verbose(`Cache request for group: ${groupJid}`);
+        const meta = await groupMetadataCache.get(key);
 
         if (Date.now() - meta.timestamp > 3600000) {
           await this.updateGroupMetadataCache(groupJid);
@@ -4677,11 +4933,39 @@ export class BaileysStartupService extends ChannelStartupService {
     return messageRaw;
   }
 
+  // Track active cron jobs so logoutInstance() + graceful shutdown can stop
+  // them. Without this, a restarted instance left its old cron running in
+  // the background, firing syncLostMessages against a dead auth state every
+  // 30 min and spamming the logs. Keyed by cron "name" for clarity.
+  private cronTasks: Map<string, any> = new Map();
+
+  private stopCronTask(name: string) {
+    const task = this.cronTasks.get(name);
+    if (!task) return;
+    try {
+      task.stop();
+    } catch (e) {
+      this.logger.warn(`Failed to stop cron "${name}": ${(e as Error)?.message ?? e}`);
+    } finally {
+      this.cronTasks.delete(name);
+    }
+  }
+
+  public stopAllCronTasks() {
+    for (const name of Array.from(this.cronTasks.keys())) {
+      this.stopCronTask(name);
+    }
+  }
+
   private async syncChatwootLostMessages() {
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
       const chatwootConfig = await this.findChatwoot();
       const prepare = (message: any) => this.prepareMessage(message);
       this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
+
+      // Replace any previous task for this name (e.g., on reconnect) so we
+      // don't end up with two crons firing the same sync job in parallel.
+      this.stopCronTask('chatwoot:syncLostMessages');
 
       // Generate ID for this cron task and store in cache
       const cronId = cuid();
@@ -4695,12 +4979,13 @@ export class BaileysStartupService extends ChannelStartupService {
           const storedId = await cache.hGet(cronKey, this.instance.name);
           if (storedId && storedId !== cronId) {
             this.logger.info(`Stopping syncChatwootLostMessages cron - ID mismatch: ${cronId} vs ${storedId}`);
-            task.stop();
+            this.stopCronTask('chatwoot:syncLostMessages');
             return;
           }
         }
         this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
       });
+      this.cronTasks.set('chatwoot:syncLostMessages', task);
       task.start();
     }
   }
@@ -4753,49 +5038,41 @@ export class BaileysStartupService extends ChannelStartupService {
   private async addLabel(labelId: string, instanceId: string, chatId: string) {
     const id = cuid();
 
-    await this.prismaRepository.$executeRawUnsafe(
-      `INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
-       VALUES ($4, $2, $3, to_jsonb(ARRAY[$1]::text[]), NOW(), NOW()) ON CONFLICT ("instanceId", "remoteJid")
-     DO
-      UPDATE
-          SET "labels" = (
+    await this.prismaRepository.$executeRaw`
+      INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
+      VALUES (${id}, ${instanceId}, ${chatId}, to_jsonb(ARRAY[${labelId}]::text[]), NOW(), NOW())
+      ON CONFLICT ("instanceId", "remoteJid")
+      DO UPDATE
+        SET "labels" = (
           SELECT to_jsonb(array_agg(DISTINCT elem))
           FROM (
-          SELECT jsonb_array_elements_text("Chat"."labels") AS elem
-          UNION
-          SELECT $1::text AS elem
+            SELECT jsonb_array_elements_text("Chat"."labels") AS elem
+            UNION
+            SELECT ${labelId}::text AS elem
           ) sub
-          ),
-          "updatedAt" = NOW();`,
-      labelId,
-      instanceId,
-      chatId,
-      id,
-    );
+        ),
+        "updatedAt" = NOW();
+    `;
   }
 
   private async removeLabel(labelId: string, instanceId: string, chatId: string) {
     const id = cuid();
 
-    await this.prismaRepository.$executeRawUnsafe(
-      `INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
-       VALUES ($4, $2, $3, '[]'::jsonb, NOW(), NOW()) ON CONFLICT ("instanceId", "remoteJid")
-     DO
-      UPDATE
-          SET "labels" = COALESCE (
+    await this.prismaRepository.$executeRaw`
+      INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
+      VALUES (${id}, ${instanceId}, ${chatId}, '[]'::jsonb, NOW(), NOW())
+      ON CONFLICT ("instanceId", "remoteJid")
+      DO UPDATE
+        SET "labels" = COALESCE(
           (
-          SELECT jsonb_agg(elem)
-          FROM jsonb_array_elements_text("Chat"."labels") AS elem
-          WHERE elem <> $1
+            SELECT jsonb_agg(elem)
+            FROM jsonb_array_elements_text("Chat"."labels") AS elem
+            WHERE elem <> ${labelId}
           ),
           '[]'::jsonb
-          ),
-          "updatedAt" = NOW();`,
-      labelId,
-      instanceId,
-      chatId,
-      id,
-    );
+        ),
+        "updatedAt" = NOW();
+    `;
   }
 
   public async baileysOnWhatsapp(jid: string) {

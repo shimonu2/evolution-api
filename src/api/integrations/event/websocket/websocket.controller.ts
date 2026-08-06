@@ -7,10 +7,20 @@ import { Server as SocketIO } from 'socket.io';
 
 import { EmitData, EventController, EventControllerInterface } from '../event.controller';
 
+// Global + per-IP WebSocket connection caps.
+// Without them, a single IP can open N thousand Socket.io connections,
+// each holding ~100 KB of buffers + a background ping timer, and starve
+// every other client. Defaults are generous for normal usage but stop
+// pathological cases. Set _MAX=0 to disable a specific cap.
+const WS_MAX_TOTAL = Number(process.env.WEBSOCKET_MAX_CONNECTIONS ?? 5_000);
+const WS_MAX_PER_IP = Number(process.env.WEBSOCKET_MAX_CONNECTIONS_PER_IP ?? 50);
+
 export class WebsocketController extends EventController implements EventControllerInterface {
   private io: SocketIO;
   private corsConfig: Array<any>;
   private readonly logger = new Logger('WebsocketController');
+  private connectionsByIp = new Map<string, number>();
+  private totalConnections = 0;
 
   constructor(prismaRepository: PrismaRepository, waMonitor: WAMonitoringService) {
     super(prismaRepository, waMonitor, configService.get<Websocket>('WEBSOCKET')?.ENABLED, 'websocket');
@@ -27,10 +37,22 @@ export class WebsocketController extends EventController implements EventControl
       cors: { origin: this.cors },
       allowRequest: async (req, callback) => {
         try {
+          const remoteAddress = req.socket.remoteAddress ?? 'unknown';
+
+          // Connection-count gate. Run this before auth so auth work isn't
+          // wasted on a connection we'd reject anyway.
+          if (WS_MAX_TOTAL > 0 && this.totalConnections >= WS_MAX_TOTAL) {
+            this.logger.warn(`WS rejected: total cap reached (${WS_MAX_TOTAL})`);
+            return callback('Too many connections (global)', false);
+          }
+          if (WS_MAX_PER_IP > 0 && (this.connectionsByIp.get(remoteAddress) ?? 0) >= WS_MAX_PER_IP) {
+            this.logger.warn(`WS rejected: per-IP cap reached for ${remoteAddress} (${WS_MAX_PER_IP})`);
+            return callback('Too many connections (per-IP)', false);
+          }
+
           const url = new URL(req.url || '', 'http://localhost');
           const params = new URLSearchParams(url.search);
 
-          const { remoteAddress } = req.socket;
           const websocketConfig = configService.get<Websocket>('WEBSOCKET');
           const allowedHosts = websocketConfig.ALLOWED_HOSTS || '127.0.0.1,::1,::ffff:127.0.0.1';
           const allowAllHosts = allowedHosts.trim() === '*';
@@ -72,9 +94,21 @@ export class WebsocketController extends EventController implements EventControl
     });
 
     this.socket.on('connection', (socket) => {
-      this.logger.info('User connected');
+      const remoteAddress = socket.handshake.address ?? 'unknown';
+      this.totalConnections++;
+      this.connectionsByIp.set(remoteAddress, (this.connectionsByIp.get(remoteAddress) ?? 0) + 1);
+      this.logger.info(
+        `User connected (total=${this.totalConnections}, ip=${remoteAddress}, ip_count=${this.connectionsByIp.get(remoteAddress)})`,
+      );
 
       socket.on('disconnect', () => {
+        this.totalConnections = Math.max(0, this.totalConnections - 1);
+        const current = (this.connectionsByIp.get(remoteAddress) ?? 1) - 1;
+        if (current <= 0) {
+          this.connectionsByIp.delete(remoteAddress);
+        } else {
+          this.connectionsByIp.set(remoteAddress, current);
+        }
         this.logger.info('User disconnected');
       });
 
@@ -89,7 +123,7 @@ export class WebsocketController extends EventController implements EventControl
       });
     });
 
-    this.logger.info('Socket.io initialized');
+    this.logger.info(`Socket.io initialized (max total=${WS_MAX_TOTAL}, max per-IP=${WS_MAX_PER_IP})`);
   }
 
   private set cors(cors: Array<any>) {

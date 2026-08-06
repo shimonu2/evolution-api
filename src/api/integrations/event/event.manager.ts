@@ -125,13 +125,20 @@ export class EventManager {
     integration?: string[];
     extra?: Record<string, any>;
   }): Promise<void> {
-    await this.websocket.emit(eventData);
-    await this.rabbitmq.emit(eventData);
-    await this.nats.emit(eventData);
-    await this.sqs.emit(eventData);
-    await this.webhook.emit(eventData);
-    await this.pusher.emit(eventData);
-    await this.kafka.emit(eventData);
+    // Run all transports concurrently with allSettled so a slow / failing one
+    // doesn't block the rest. Previous sequential await chain meant an SQS
+    // timeout would delay pusher + kafka; a RabbitMQ reconnect blocked every
+    // later transport; etc. Each transport already logs its own failures, so
+    // we only need to ensure no unhandled rejection escapes.
+    await Promise.allSettled([
+      this.websocket.emit(eventData),
+      this.rabbitmq.emit(eventData),
+      this.nats.emit(eventData),
+      this.sqs.emit(eventData),
+      this.webhook.emit(eventData),
+      this.pusher.emit(eventData),
+      this.kafka.emit(eventData),
+    ]);
   }
 
   public async setInstance(instanceName: string, data: any): Promise<any> {

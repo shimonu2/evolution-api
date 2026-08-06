@@ -9,6 +9,19 @@ const logger = new Logger('S3 Service');
 
 const BUCKET = new ConfigService().get<S3>('S3');
 
+// Uploads can legitimately take a while for large media, but they should never
+// hang forever. Cap per-operation time so a flaky S3 endpoint cannot block the
+// caller indefinitely. Overridable via S3_TIMEOUT_MS.
+const S3_TIMEOUT_MS = Number(process.env.S3_TIMEOUT_MS ?? 60_000);
+
+function withTimeout<T>(op: Promise<T>, label: string, ms = S3_TIMEOUT_MS): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`S3 ${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([op, timeout]).finally(() => clearTimeout(timer));
+}
+
 interface Metadata extends MinIo.ItemBucketMetadata {
   'Content-Type': string;
 }
@@ -83,7 +96,10 @@ const uploadFile = async (fileName: string, file: Buffer | Transform | Readable,
     const objectName = join('evolution-api', fileName);
     try {
       metadata['custom-header-application'] = 'evolution-api';
-      return await minioClient.putObject(bucketName, objectName, file, size, metadata);
+      return await withTimeout(
+        minioClient.putObject(bucketName, objectName, file, size, metadata),
+        `putObject ${objectName}`,
+      );
     } catch (error) {
       logger.error(error);
       return error;
@@ -95,10 +111,10 @@ const getObjectUrl = async (fileName: string, expiry?: number) => {
   if (minioClient) {
     try {
       const objectName = join('evolution-api', fileName);
-      if (expiry) {
-        return await minioClient.presignedGetObject(bucketName, objectName, expiry);
-      }
-      return await minioClient.presignedGetObject(bucketName, objectName);
+      const op = expiry
+        ? minioClient.presignedGetObject(bucketName, objectName, expiry)
+        : minioClient.presignedGetObject(bucketName, objectName);
+      return await withTimeout(op, `presignedGetObject ${objectName}`);
     } catch (error) {
       throw new BadRequestException(error?.message);
     }
@@ -116,7 +132,10 @@ const uploadTempFile = async (
     const objectName = join(folder, fileName);
     try {
       metadata['custom-header-application'] = 'evolution-api';
-      return await minioClient.putObject(bucketName, objectName, file, size, metadata);
+      return await withTimeout(
+        minioClient.putObject(bucketName, objectName, file, size, metadata),
+        `putObject ${objectName}`,
+      );
     } catch (error) {
       logger.error(error);
       return error;
@@ -128,7 +147,7 @@ const deleteFile = async (folder: string, fileName: string) => {
   if (minioClient) {
     const objectName = join(folder, fileName);
     try {
-      return await minioClient.removeObject(bucketName, objectName);
+      return await withTimeout(minioClient.removeObject(bucketName, objectName), `removeObject ${objectName}`);
     } catch (error) {
       logger.error(error);
       return error;

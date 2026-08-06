@@ -31,6 +31,60 @@ export class WAMonitoringService {
     Object.assign(this.redis, configService.get<CacheConf>('CACHE'));
 
     (this as any).providerSession = Object.freeze(configService.get<ProviderSession>('PROVIDER'));
+
+    this.startZombieDetector();
+  }
+
+  // Periodically check whether any instance is marked "open" but its socket
+  // is actually dead (client/user missing, or connection status mismatch).
+  // Baileys' internal detection can be slow — we've seen instances silently
+  // accept sends against a zombied socket for minutes before the lib notices.
+  // Disable with INSTANCE_HEALTHCHECK=false; tune cadence via _INTERVAL_MS.
+  private zombieInterval: NodeJS.Timeout | null = null;
+  // Track which instances have a reload in flight so we don't fire a second
+  // one while the first is still racing with (or completing into) Baileys'
+  // own connection.update-driven reconnect path. Without this, a long reload
+  // followed by a natural reconnect could double-close the fresh socket.
+  private reloadingInstances: Set<string> = new Set();
+
+  private startZombieDetector() {
+    if (process.env.INSTANCE_HEALTHCHECK === 'false') return;
+    const intervalMs = Number(process.env.INSTANCE_HEALTHCHECK_INTERVAL_MS ?? 60_000);
+    this.zombieInterval = setInterval(() => {
+      for (const [name, inst] of Object.entries(this.waInstances)) {
+        try {
+          const state = inst?.stateConnection?.state ?? inst?.connectionStatus?.state;
+          const hasUser = !!inst?.client?.user;
+          // Only treat state="open" with no user as a zombie. Skip explicitly
+          // when Baileys is already reconnecting ("connecting"), logging out,
+          // or closed — those states will drive their own lifecycle.
+          if (state !== 'open' || hasUser) continue;
+          if (this.reloadingInstances.has(name)) continue;
+
+          this.logger.warn(`Zombie instance detected ("${name}" state=open but no client.user) — reloading`);
+          this.reloadingInstances.add(name);
+          const p = inst.reloadConnection?.();
+          if (p && typeof p.finally === 'function') {
+            p.catch((err: unknown) =>
+              this.logger.error(`Zombie reload failed for "${name}": ${(err as Error)?.message ?? err}`),
+            ).finally(() => this.reloadingInstances.delete(name));
+          } else {
+            this.reloadingInstances.delete(name);
+          }
+        } catch (err) {
+          this.logger.error(`Zombie detector error for "${name}": ${(err as Error)?.message ?? err}`);
+          this.reloadingInstances.delete(name);
+        }
+      }
+    }, intervalMs);
+    this.zombieInterval.unref();
+  }
+
+  public stopZombieDetector() {
+    if (this.zombieInterval) {
+      clearInterval(this.zombieInterval);
+      this.zombieInterval = null;
+    }
   }
 
   private readonly db: Partial<Database> = {};

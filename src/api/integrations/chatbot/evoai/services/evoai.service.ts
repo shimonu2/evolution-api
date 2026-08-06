@@ -3,6 +3,7 @@ import { WAMonitoringService } from '@api/services/monitor.service';
 import { Integration } from '@api/types/wa.types';
 import { ConfigService, HttpServer } from '@config/env.config';
 import { Evoai, EvoaiSetting, IntegrationSession } from '@prisma/client';
+import { circuitPost } from '@utils/circuitBreaker';
 import axios from 'axios';
 import { downloadMediaMessage } from 'baileys';
 import { isURL } from 'class-validator';
@@ -10,6 +11,8 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { BaseChatbotService } from '../../base-chatbot.service';
 import { OpenaiService } from '../../openai/services/openai.service';
+
+const HTTP_TIMEOUT_MS = 30_000;
 
 export class EvoaiService extends BaseChatbotService<Evoai, EvoaiSetting> {
   private openaiService: OpenaiService;
@@ -91,7 +94,10 @@ export class EvoaiService extends BaseChatbotService<Evoai, EvoaiSetting> {
             let mediaBase64 = msg.message.base64 || null;
 
             if (msg.message.mediaUrl && isURL(msg.message.mediaUrl)) {
-              const result = await axios.get(msg.message.mediaUrl, { responseType: 'arraybuffer' });
+              const result = await axios.get(msg.message.mediaUrl, {
+                responseType: 'arraybuffer',
+                timeout: HTTP_TIMEOUT_MS,
+              });
               mediaBase64 = Buffer.from(result.data).toString('base64');
             }
 
@@ -168,11 +174,12 @@ export class EvoaiService extends BaseChatbotService<Evoai, EvoaiSetting> {
         await instance.client.sendPresenceUpdate('composing', remoteJid);
       }
 
-      const response = await axios.post(endpoint, payload, {
+      const response = await circuitPost(endpoint, payload, {
         headers: {
           'x-api-key': evoai.apiKey,
           'Content-Type': 'application/json',
         },
+        timeout: HTTP_TIMEOUT_MS,
       });
 
       this.logger.debug(`[EvoAI] Response: ${JSON.stringify(response.data)}`);

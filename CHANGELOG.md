@@ -1,3 +1,268 @@
+# 2.3.8-robustness.0414.9 (2026-05-06)
+
+### LID contacts.update deduplication fix
+
+* **Root cause**: Baileys fires `contacts.update` independently of `messages.upsert`.
+  That handler used `contact.id` raw, so every @lid event created a duplicate
+  contact row under the @lid JID even after the messages.upsert normalization fix.
+* **Fix**: skip any `contact.id` containing `@lid` in the `contacts.update` handler.
+  The canonical record under `@s.whatsapp.net` is maintained by messages.upsert.
+
+# 2.3.8-robustness.0414.8 (2026-05-06)
+
+### LID contact lookup + contactRaw normalization fix
+
+* **Root cause**: contact DB lookup and `contactRaw.remoteJid` still used
+  `received.key.remoteJid` (raw `@lid` JID) instead of `normalizedRemoteJid`.
+  For contacts stored under `@s.whatsapp.net`, the lookup returned null —
+  `CONTACTS_UPDATE` webhook was skipped and duplicate contact rows were
+  created (one under `@lid`, one under `@s.whatsapp.net`).
+* **Fix**: `findFirst`, `contactRaw.remoteJid`, and `profilePicture()` call
+  all now use `normalizedRemoteJid` so contact upsert and webhook dispatch
+  are consistent with the rest of the `@lid` normalization path.
+
+# 2.3.8-robustness.0414.7 (2026-05-06)
+
+### LID webhook dispatch fix (immutable key)
+
+* **Root cause**: the in-place mutation `messageRaw.key.remoteJid = remoteJidAlt`
+  throws a TypeError when Baileys returns a protobuf-derived key with a
+  read-only `remoteJid` property. The outer try-catch swallows the error,
+  silently skipping the `sendDataWebhook` call — webhook never fires.
+* **Fix**: compute `normalizedRemoteJid` from `remoteJidAlt`, then spread
+  a new plain-JS key object `{ ...messageRaw.key, remoteJid: normalizedRemoteJid }`
+  so the property is always writable. No mutation of the original key.
+* `dispatchPayload` carries the normalized key to both `sendDataWebhook`
+  and `chatbotController.emit`; `messageRaw` (with the original `@lid` key)
+  is preserved in the DB record for audit.
+
+# 2.3.8-robustness.0414.6 (2026-05-06)
+
+### LID addressing webhook fix
+
+* **LID → phone JID normalization hardened**: the `console.log(messageRaw)`
+  debug artifact left in the `messages.upsert` handler is removed.
+  The normalization block is now guarded by explicit if/else branches:
+  - when `remoteJidAlt` is present, logs `logger.info` with both JIDs for
+    observability, then replaces `remoteJid` before webhook dispatch.
+  - when `remoteJidAlt` is missing (edge case), logs `logger.warn` so
+    operators can spot LID messages that will still carry a raw `@lid` JID
+    downstream instead of silently passing through.
+
+# 2.3.8-robustness.0414.5 (2026-04-15)
+
+### Caller-blocking + DoS surfaces closed
+
+Cleared the remaining items from the "what's left on the table" list.
+
+* **event manager** runs all 7 transports in parallel via Promise.allSettled
+  instead of awaiting them one at a time. Previously a slow webhook (with
+  retries up to ~25 min) blocked every later transport AND the caller
+  (channel.service awaits emit() on every received message).
+* **webhook retries are now fire-and-forget** from emit()'s perspective.
+  retryWebhookRequest still logs each attempt, just doesn't park the
+  request handler waiting on it.
+* **WebSocket connection caps**: WEBSOCKET_MAX_CONNECTIONS (default 5000)
+  and WEBSOCKET_MAX_CONNECTIONS_PER_IP (default 50). Closes a memory-DoS
+  surface where a single IP could open thousands of Socket.io clients.
+* **trust proxy is conditional** via TRUST_PROXY_HOPS (default 1). Set to
+  0 if not behind a reverse proxy, otherwise X-Forwarded-For spoofing
+  bypasses the rate limiter. Startup logs the chosen value.
+* **Cron jobs are tracked + cleaned** on logoutInstance and graceful
+  shutdown. The Chatwoot syncLostMessages cron used to keep firing every
+  30 min after logout, spamming errors against a dead auth state.
+* **ensureConnected opt-out** via ENSURE_CONNECTED_ON_SEND=false for
+  operators who relied on the pre-0414 silent-queue behavior. Default
+  stays "fail fast".
+* **groupMetadataCache keys are scoped per instance**. Multiple Baileys
+  instances can be members of the same WA group; without scoping, they
+  overwrote each other's cached metadata.
+
+### Live-run validation
+
+This version was actually started against a no-Redis / no-Postgres env to
+verify the L1/L2 fixes from 0414.4 work as intended:
+- Redis logs throttled to attempts 0/1 only (3 clients × 6 lines instead
+  of 3 × 60), `redis error:` now contains the actual ECONNREFUSED message.
+- Bootstrap failure produces a one-line operator message ("Cannot connect
+  to database: ...") and exits cleanly instead of dumping the Prisma
+  query-engine stack.
+
+# 2.3.8-robustness.0414.4 (2026-04-15)
+
+### Close-the-gap fixes after live run
+
+Issues that only surfaced when I actually started the server against a real
+(broken) environment, plus the audit-flagged legacy code paths I hadn't
+touched in the first two rounds.
+
+**Live-run regressions closed**
+* L3: body limit 5mb → 50mb default (tunable via REQUEST_BODY_LIMIT_MB).
+  5mb was rejecting legitimate base64 `/send/media` payloads.
+* L2: bootstrap failures now print a one-line operator message instead of
+  a 4 kB Prisma internal stack dump. SIGTERM / SIGINT handlers register
+  BEFORE async init so Ctrl+C works during startup hangs.
+* L1: Redis reconnect logs throttled to attempts 1, 5, 10, 15, 20.
+  AggregateError is unwrapped so `redis error:` is never empty. Duplicate
+  error messages deduped within a 30s window.
+
+**Legacy paths hardened (out of scope of first two rounds)**
+* **WA Business channel** `post()` used to return `undefined` on any
+  error — messages were silently dropped. Now throws, with a 30s timeout.
+* **WA Business `downloadMediaMessage`**: 15s metadata timeout, 60s +
+  50 mb body cap on the actual download (was unbounded). Tunable via
+  `WA_MEDIA_MAX_BYTES`.
+* **Chatwoot Postgres pool** now properly disposed on graceful shutdown;
+  recreated on pool error instead of handing out a dead pool. Added pool
+  max, idle + connection timeouts.
+* **Chatwoot axios calls** got 30s timeouts (message POSTs) + size caps
+  (media prefetch 50 mb, ads thumbnail 10 mb).
+* **Baileys media inlining** for `webhookBase64` now checks `fileLength`
+  before download and skips files > `WA_MEDIA_MAX_BYTES`. Previously a
+  100 mb WA document allocated ~233 mb of RAM per inbound message.
+* **Baileys cache TTLs**: `msgRetryCounterCache` was never expiring
+  (accumulated forever); now 1 h stdTTL. `userDevicesCache` had a bogus
+  `300000` literal interpreted as seconds (= 3.5 days!); now 300 s.
+
+# 2.3.8-robustness.0414.3 (2026-04-15)
+
+### Self-audit fixes
+
+Follow-up to 0414.2 addressing 7 real bugs surfaced by a code review of the
+new robustness code itself.
+
+* **baileys**: `pairingStartedAt` now resets on `connection=close` so a
+  failed pairing attempt doesn't instantly trip the budget check on retry.
+* **baileys**: `saveCredsChain` internal reference is now always-resolved
+  (via a `.catch` mapping) so one failed `saveCreds` can't leave the chain
+  in a rejected state that short-circuits subsequent writes.
+* **baileys**: `sendWithRetry` uses a 500ms `ensureConnected` window on
+  retry attempts (down from 5s), capping total wall-clock at ~6.5s so a
+  single send can no longer park an HTTP request for ~11.5s.
+* **metrics**: `collectDefaultMetrics` wrapped in a guard flag + try/catch
+  so tsx-watch reloads and jest module resets can't crash the process with
+  "Duplicated metrics in registry".
+* **nats**: `closed()` now uses a single `.then(onFulfilled, onRejected)`
+  so the rejection handler is attached synchronously (no microtask gap).
+* **monitor**: zombie detector tracks in-flight reloads in a `Set<string>`
+  so it can't fire a second `reloadConnection()` while a previous one is
+  still racing with a Baileys-driven reconnect.
+* **logger**: `safeLog` now strips ANSI escape codes before the stderr
+  fallback write so emergency output is readable in log aggregators.
+
+# 2.3.8-robustness.0414.2 (2026-04-14)
+
+### Robustness Hardening — Part 2
+
+Follow-up to 0414 — closes the remaining audit items.
+
+**Data & correctness**
+* Replaced `$executeRawUnsafe` in Baileys label ops with idiomatic
+  `$executeRaw` tagged templates.
+* Untracked `.DS_Store` (was lingering in the index despite .gitignore).
+* Per-instance `saveCreds()` mutex so concurrent creds.update writes can't
+  interleave and corrupt auth state.
+
+**Log / IO hardening**
+* `console.log` in the Logger now goes through `safeLog()` — falls back to
+  stderr, silently drops on double-failure, so a broken stdout pipe can't
+  crash the process.
+* 60s `withTimeout()` wrapper around every S3/MinIO `putObject`,
+  `presignedGetObject`, `removeObject`. Tunable via `S3_TIMEOUT_MS`.
+
+**Baileys stability**
+* `ensureConnected()` pre-send guard: rejects immediately if the socket
+  isn't open (waits up to 5s). Stops silent "queued into the void" sends.
+* `sendWithRetry()` retries once on transport errors (`ECONNRESET`,
+  `ETIMEDOUT`, `WebSocket was closed`, `Connection Closed`, `Stream Errored`).
+  Never retries blindly — would cause double-sends.
+* Sequential status-broadcast batches with `STATUS_BATCH_DELAY_MS` (default
+  200ms) instead of `Promise.allSettled` parallel fire. Stops WhatsApp
+  from banning numbers that blast 100+ sends in a second.
+* Absolute `PAIRING_BUDGET_MS` (5min default) wall-clock budget on QR
+  pairing on top of the count limit.
+* Bounded OpenAI Assistant run polling by wall-clock (`OPENAI_ASSISTANT_BUDGET_MS`,
+  default 90s) with adaptive interval 1s → 5s.
+
+**Operational visibility**
+* Zombie instance detector: background interval that walks `waInstances`
+  and calls `reloadConnection()` on entries with `state=open` but no
+  `client.user`. Disable via `INSTANCE_HEALTHCHECK=false`.
+* Prometheus `/metrics` endpoint — default Node.js internals (CPU, GC,
+  event-loop lag) + custom gauges for instance state, messages sent,
+  chatbot calls, reconnect count. Disable via `METRICS=false`.
+* `ecosystem.config.js` for PM2 with `max_memory_restart: 1G`,
+  `kill_timeout: 30s`, exponential backoff on restart storms.
+
+**Integration resilience**
+* Per-endpoint circuit breaker (opossum) around all chatbot POST calls
+  (Dify, Flowise, N8N, Typebot, EvoAI, EvolutionBot). After 5 calls with
+  >50% error rate the breaker opens for 30s, then half-opens a probe.
+  4xx responses are excluded from the error count. Tunable / disable via
+  env.
+* RabbitMQ queues support an optional `RABBITMQ_MAX_QUEUE_LENGTH` with
+  `x-overflow=drop-head`, preventing unbounded growth when consumers lag.
+* SQS `sendMessage` converted from callback form to awaited
+  `SendMessageCommand` so `emit()` reflects actual send completion.
+* NATS now connects with `maxReconnectAttempts: -1` and 2s backoff,
+  observes status() + closed(), skips publish when `isClosed()`.
+
+**Security / deps**
+* npm audit: 66 → 5 findings (all dev-only commitizen transitives;
+  0 critical, no runtime impact). Added `overrides` for
+  `@figuro/chatwoot-sdk` → `axios ^1.14.1` to eliminate the critical
+  axios CVE chain and `brace-expansion ^2.0.3` for the ReDoS fix.
+
+# 2.3.8-robustness.0414 (2026-04-14)
+
+### Robustness Hardening
+
+Non-feature release focused on preventing hangs, crashes, and resource leaks
+observed in long-running multi-instance deployments.
+
+**HTTP / bootstrap**
+* Set `keepAliveTimeout`, `headersTimeout`, `requestTimeout`, `maxConnections`
+  on the HTTP server to prevent socket / file-descriptor exhaustion.
+* Dropped JSON and urlencoded body limits from 136 MB to 5 MB to prevent
+  single-request OOM.
+* Fixed axios-instance leak and swallowed rejection in the error-webhook path.
+* Added `helmet()`, `express-rate-limit` (600 req/min per IP, tunable),
+  and `trust proxy` for correct client-IP keying behind an LB.
+* Added `/health/live` and `/health/ready` (DB ping) endpoints for K8s probes.
+
+**Graceful shutdown**
+* `SIGTERM` / `SIGINT` handlers close HTTP server, all Baileys sockets,
+  Prisma, and Redis before exiting. 25s force-exit fallback.
+* `uncaughtException` now reports to Sentry and exits(1) so the process
+  manager can restart into a clean state. Override via `EXIT_ON_UNCAUGHT=false`.
+* `unhandledRejection` reports to Sentry without exiting.
+
+**Database (Prisma)**
+* Added connection pool (`connection_limit=20`, tunable), `connect_timeout`,
+  `pool_timeout`, and Postgres `statement_timeout=15s` via URL params.
+* Pipes Prisma's own warn/error events into the app logger.
+
+**Cache (Redis)**
+* Real reconnect strategy (progressive backoff, up to 20 attempts).
+* 5s connect timeout.
+* Fixed bug that set `connected=true` before `connect()` resolved.
+* Added `disconnect()` for graceful shutdown.
+
+**WhatsApp (Baileys)**
+* Removed duplicate inline `connection.update` listener in `createClient()`
+  that raced with `connectionUpdate()` and caused zombie instances and
+  occasional auth-state corruption on disconnect.
+* Defensive cleanup of previous socket listeners before creating a new one.
+* Isolated each event branch in `eventHandler()` with per-branch try/catch
+  so a throw in one handler no longer skips the rest of the batch.
+* Wrapped unguarded `client.end()` in the close path.
+
+**Chatbot integrations**
+* Added 30s timeouts to all outbound axios calls and the OpenAI SDK client
+  (OpenAI, Dify, Flowise, N8N, Typebot, EvoAI, EvolutionBot, Whisper, and
+  media downloads). A stuck upstream can no longer freeze message
+  processing for an instance indefinitely.
+
 # 2.3.7 (2025-12-05)
 
 ### Features

@@ -6,6 +6,21 @@ import * as amqp from 'amqplib/callback_api';
 
 import { EmitData, EventController, EventControllerInterface } from '../event.controller';
 
+// Optional bound on how many messages a queue may hold before the broker
+// starts dropping. Without this, a stuck or missing consumer accumulates
+// messages indefinitely and eventually exhausts broker memory. Default 0
+// (no limit — preserves prior behavior) so operators opt in.
+const MAX_QUEUE_LENGTH = Number(process.env.RABBITMQ_MAX_QUEUE_LENGTH ?? 0);
+
+function queueArgs(): Record<string, unknown> {
+  const args: Record<string, unknown> = { 'x-queue-type': 'quorum' };
+  if (MAX_QUEUE_LENGTH > 0) {
+    args['x-max-length'] = MAX_QUEUE_LENGTH;
+    args['x-overflow'] = 'drop-head';
+  }
+  return args;
+}
+
 export class RabbitmqController extends EventController implements EventControllerInterface {
   public amqpChannel: amqp.Channel | null = null;
   private amqpConnection: amqp.Connection | null = null;
@@ -264,9 +279,7 @@ export class RabbitmqController extends EventController implements EventControll
             await this.amqpChannel.assertQueue(queueName, {
               durable: true,
               autoDelete: false,
-              arguments: {
-                'x-queue-type': 'quorum',
-              },
+              arguments: queueArgs(),
             });
 
             await this.amqpChannel.bindQueue(queueName, exchangeName, eventName);
@@ -317,9 +330,7 @@ export class RabbitmqController extends EventController implements EventControll
           await this.amqpChannel.assertQueue(queueName, {
             durable: true,
             autoDelete: false,
-            arguments: {
-              'x-queue-type': 'quorum',
-            },
+            arguments: queueArgs(),
           });
 
           await this.amqpChannel.bindQueue(queueName, exchangeName, event);
@@ -388,9 +399,7 @@ export class RabbitmqController extends EventController implements EventControll
         await this.amqpChannel.assertQueue(queueName, {
           durable: true,
           autoDelete: false,
-          arguments: {
-            'x-queue-type': 'quorum',
-          },
+          arguments: queueArgs(),
         });
 
         await this.amqpChannel.bindQueue(queueName, exchangeName, event);

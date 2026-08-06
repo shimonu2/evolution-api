@@ -1,6 +1,6 @@
 {
   "name": "evolution-api",
-  "version": "2.3.7",
+  "version": "2.3.8-robustness.0414.10",
   "description": "Rest api for communication with WhatsApp",
   "main": "./dist/main.js",
   "type": "commonjs",
@@ -64,6 +64,12 @@
       "path": "cz-conventional-changelog"
     }
   },
+  "overrides": {
+    "@figuro/chatwoot-sdk": {
+      "axios": "^1.14.1"
+    },
+    "brace-expansion": "^2.0.3"
+  },
   "dependencies": {
     "@adiwajshing/keyed-db": "^0.2.4",
     "@aws-sdk/client-sqs": "^3.891.0",
@@ -87,10 +93,12 @@
     "eventemitter2": "^6.4.9",
     "express": "^4.21.2",
     "express-async-errors": "^3.1.1",
+    "express-rate-limit": "^7.5.1",
+    "fetch-socks": "^1.3.2",
     "fluent-ffmpeg": "^2.1.3",
     "form-data": "^4.0.1",
+    "helmet": "^8.1.0",
     "https-proxy-agent": "^7.0.6",
-    "fetch-socks": "^1.3.2",
     "i18next": "^23.7.19",
     "jimp": "^1.6.0",
     "json-schema": "^0.4.0",
@@ -109,9 +117,11 @@
     "node-cache": "^5.1.2",
     "node-cron": "^3.0.3",
     "openai": "^4.77.3",
+    "opossum": "^8.5.0",
     "pg": "^8.13.1",
     "pino": "^9.10.0",
     "prisma": "^6.1.0",
+    "prom-client": "^15.1.3",
     "pusher": "^5.2.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",

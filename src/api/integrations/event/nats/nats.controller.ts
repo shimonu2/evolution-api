@@ -23,9 +23,37 @@ export class NatsController extends EventController implements EventControllerIn
     try {
       const uri = configService.get<Nats>('NATS').URI;
 
-      this.natsClient = await connect({ servers: uri });
+      // Reconnect forever with a 2s backoff — NATS outages should be transient
+      // and publish() calls made during disconnect are buffered client-side.
+      this.natsClient = await connect({
+        servers: uri,
+        reconnect: true,
+        maxReconnectAttempts: -1,
+        reconnectTimeWait: 2_000,
+        pingInterval: 30_000,
+      });
 
       this.logger.info('NATS initialized');
+
+      // Observe disconnect / reconnect events so operators see them.
+      (async () => {
+        for await (const status of this.natsClient.status()) {
+          if (status.type === 'disconnect' || status.type === 'reconnect' || status.type === 'error') {
+            this.logger.warn(`NATS status: ${status.type} ${String((status as any).data ?? '')}`);
+          }
+        }
+      })().catch((err) => this.logger.error(`NATS status stream error: ${(err as Error)?.message ?? err}`));
+
+      // Surface permanent connection close. Use a single then(onFulfilled,
+      // onRejected) so the rejection handler is attached synchronously and
+      // there is no microtask window where a rejection could go unhandled.
+      this.natsClient.closed().then(
+        (err) => {
+          if (err) this.logger.error(`NATS connection closed with error: ${err?.message ?? err}`);
+          else this.logger.warn('NATS connection closed');
+        },
+        (err) => this.logger.error(`NATS closed() rejected: ${(err as Error)?.message ?? err}`),
+      );
 
       if (configService.get<Nats>('NATS')?.GLOBAL_ENABLED) {
         await this.initGlobalSubscriptions();
@@ -54,6 +82,14 @@ export class NatsController extends EventController implements EventControllerIn
     }
 
     if (!this.status || !this.natsClient) {
+      return;
+    }
+
+    // Don't attempt publish if the client has gone away; publish() would throw
+    // and the buffering semantics we rely on during reconnect only apply while
+    // the connection is merely disconnected, not closed.
+    if (this.natsClient.isClosed()) {
+      this.logger.warn(`Skipping NATS publish for event ${event}: client is closed`);
       return;
     }
 

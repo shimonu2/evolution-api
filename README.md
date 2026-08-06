@@ -18,6 +18,26 @@
   
 <div align="center"><img src="./public/images/cover.png"></div>
 
+---
+
+## 🛡️ Robust-0414 fork notice
+
+This repository is a hardened fork of upstream `EvolutionAPI/evolution-api`,
+focused on production reliability — preventing hangs, crashes, resource
+leaks, and silent message loss observed in long-running multi-instance
+deployments.
+
+**For operators**: read these in order:
+- [`DEPLOY.md`](./DEPLOY.md) — production deploy runbook (Docker image, compose, env, verification)
+- [`ROBUSTNESS.md`](./ROBUSTNESS.md) — full reference for the 23 new env vars and behavior changes
+- [`CHANGELOG.md`](./CHANGELOG.md) — what shipped in each `2.3.8-robustness.0414.x` release
+
+**Docker image**: `shimonuziel/evolution-api:robust-0414.5` (multi-arch: amd64, arm64).
+
+**Branch**: `feat/robustness-0414`. **PR**: [#1](https://github.com/shimonu2/evolution-api/pull/1).
+
+---
+
 ## Evolution API
 
 Evolution API began as a WhatsApp controller API based on [CodeChat](https://github.com/code-chat-br/whatsapp-api), which in turn implemented the [Baileys](https://github.com/WhiskeySockets/Baileys) library. While originally focused on WhatsApp, Evolution API has grown into a comprehensive platform supporting multiple messaging services and integrations. We continue to acknowledge CodeChat for laying the groundwork.

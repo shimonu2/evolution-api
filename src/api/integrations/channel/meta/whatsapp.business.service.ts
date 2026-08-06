@@ -76,15 +76,23 @@ export class BusinessStartupService extends ChannelStartupService {
   }
 
   private async post(message: any, params: string) {
+    // Previously swallowed ALL errors and returned `e.response?.data?.error`
+    // (often undefined). A 500 or network timeout looked like a successful
+    // send to the caller, and messages were lost without trace. Now we
+    // throw on any failure so the REST controller can surface the error
+    // to the client and webhook observers see the drop.
+    let urlServer = this.configService.get<WaBusiness>('WA_BUSINESS').URL;
+    const version = this.configService.get<WaBusiness>('WA_BUSINESS').VERSION;
+    urlServer = `${urlServer}/${version}/${this.number}/${params}`;
+    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${this.token}` };
     try {
-      let urlServer = this.configService.get<WaBusiness>('WA_BUSINESS').URL;
-      const version = this.configService.get<WaBusiness>('WA_BUSINESS').VERSION;
-      urlServer = `${urlServer}/${version}/${this.number}/${params}`;
-      const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${this.token}` };
-      const result = await axios.post(urlServer, message, { headers });
+      const result = await axios.post(urlServer, message, { headers, timeout: 30_000 });
       return result.data;
     } catch (e) {
-      return e.response?.data?.error;
+      const metaErr = (e as any)?.response?.data?.error;
+      const summary = metaErr?.message ?? (e as Error)?.message ?? String(e);
+      this.logger.error(`WA Business post(${params}) failed: ${summary}`);
+      throw new InternalServerErrorException(metaErr ?? summary);
     }
   }
 
@@ -141,6 +149,11 @@ export class BusinessStartupService extends ChannelStartupService {
   }
 
   private async downloadMediaMessage(message: any) {
+    // 50mb cap matches the REST body limit. WhatsApp Business' own per-file
+    // limit is 16mb (image/audio) to 100mb (document/video) depending on
+    // type; 50mb covers the common case while preventing a rogue URL from
+    // streaming 10gb into memory. Overridable via WA_MEDIA_MAX_BYTES.
+    const maxBytes = Number(process.env.WA_MEDIA_MAX_BYTES ?? 50 * 1024 * 1024);
     try {
       const id = message[message.type].id;
       let urlServer = this.configService.get<WaBusiness>('WA_BUSINESS').URL;
@@ -149,12 +162,15 @@ export class BusinessStartupService extends ChannelStartupService {
       const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${this.token}` };
 
       // Primeiro, obtenha a URL do arquivo
-      let result = await axios.get(urlServer, { headers });
+      let result = await axios.get(urlServer, { headers, timeout: 15_000 });
 
       // Depois, baixe o arquivo usando a URL retornada
       result = await axios.get(result.data.url, {
         headers: { Authorization: `Bearer ${this.token}` }, // Use apenas o token de autorização para download
         responseType: 'arraybuffer',
+        timeout: 60_000,
+        maxContentLength: maxBytes,
+        maxBodyLength: maxBytes,
       });
 
       return result.data;

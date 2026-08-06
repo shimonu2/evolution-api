@@ -4,6 +4,32 @@ import fs from 'fs';
 import { configService, Log } from './env.config';
 const packageJson = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
 
+// stdout or stderr pipes can break (e.g. log aggregator dies, --logs closed,
+// container cgroup OOMs the sidecar). A raw console.log throwing there will
+// bubble up into the request path and crash the process. Wrap every write so
+// a log failure can never take us down — silently drop rather than crash.
+// Strip ANSI escape codes when falling back to stderr so the emergency output
+// is readable in aggregator UIs that don't render color.
+// eslint-disable-next-line no-control-regex
+const ANSI_PATTERN = /\u001b\[[0-9;]*m/g;
+
+function safeLog(...args: unknown[]): void {
+  try {
+    console.log(...args);
+  } catch {
+    try {
+      const line =
+        args
+          .map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a)))
+          .join(' ')
+          .replace(ANSI_PATTERN, '') + '\n';
+      process.stderr.write(line);
+    } catch {
+      // Both stdout and stderr are broken — give up rather than recurse.
+    }
+  }
+}
+
 const formatDateLog = (timestamp: number) =>
   dayjs(timestamp)
     .toDate()
@@ -82,7 +108,7 @@ export class Logger {
     const typeValue = typeof value;
     if (types.includes(type)) {
       if (configService.get<Log>('LOG').COLOR) {
-        console.log(
+        safeLog(
           /*Command.UNDERSCORE +*/ Command.BRIGHT + Level[type],
           '[Evolution API]',
           Command.BRIGHT + Color[type],
@@ -107,9 +133,9 @@ export class Logger {
           typeValue !== 'object' ? value : '',
           Command.RESET,
         );
-        typeValue === 'object' ? console.log(/*Level.DARK,*/ value, '\n') : '';
+        if (typeValue === 'object') safeLog(value, '\n');
       } else {
-        console.log(
+        safeLog(
           '[Evolution API]',
           this.instance ? `[${this.instance}]` : '',
           process.pid.toString(),
